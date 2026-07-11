@@ -1,2 +1,2 @@
 # Greenbuck
-A security-research project demonstrating that TLS alone doesn't hide behavior — using timing side-channel analysis to fingerprint user actions in encrypted mobile finance apps, with a Raspberry Pi 5 capture rig and a FastAPI + PostgreSQL pipeline that measures and classifies request timing.
+A security-research project investigating whether TLS encryption alone conceals user behavior — using network timing side-channel analysis to classify user actions in an encrypted mobile finance app. Built with a Flutter client, a FastAPI + PostgreSQL backend, and a Raspberry Pi 5 capture rig that records request timing and packet features for offline classification. Evaluates three server-side mitigations against the attack.
