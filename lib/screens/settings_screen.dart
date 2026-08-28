@@ -3,6 +3,7 @@
 
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import 'login_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -73,6 +74,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _setPlatform(String v) {
     setState(() => _platform = v);
     _apiService.platform = v;
+  }
+
+  // Fires POST /auth/logout, then pops back to the login screen.
+  Future<void> _handleLogout() async {
+    try {
+      await _apiService.logout(_apiService.authToken ?? 'no-token');
+    } catch (e) {
+      debugPrint('Logout failed: $e');
+    }
+    _apiService.authToken = null;
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
   }
 
   @override
@@ -179,6 +195,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _buildRadio('Android', 'android', _platform, _setPlatform),
               _buildRadio('iOS', 'ios', _platform, _setPlatform),
             ],
+          ),
+        ),
+        _buildSection(
+          title: 'Session',
+          subtitle: 'Log out and return to the login screen',
+          child: SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+              icon: const Icon(Icons.logout),
+              label: const Text('Log Out'),
+              onPressed: _handleLogout,
+            ),
           ),
         ),
         const SizedBox(height: 8),

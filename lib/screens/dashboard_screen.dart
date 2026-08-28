@@ -1,4 +1,5 @@
-// Dashboard — calculates and shows real balance from backend data.
+// Dashboard — shows balance from the dedicated /balance endpoint
+// and recent transactions from /transactions. Two distinct API calls.
 
 import 'package:flutter/material.dart';
 import '../models/transaction.dart';
@@ -14,25 +15,31 @@ class DashboardScreen extends StatefulWidget {
 class _DashboardScreenState extends State<DashboardScreen> {
   final ApiService _apiService = ApiService();
 
-  List<Transaction> _transactions = [];
+  double? _balance;
+  List<Transaction> _recent = [];
   bool _loading = true;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _loadTransactions();
+    _loadDashboard();
   }
 
-  Future<void> _loadTransactions() async {
+  // Fires two requests: /balance for the summary, /transactions for recent list.
+  // These are distinct research actions and will appear as separate
+  // entries in the timing log.
+  Future<void> _loadDashboard() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
+      final balance = await _apiService.getBalance();
       final transactions = await _apiService.getTransactions();
       setState(() {
-        _transactions = transactions;
+        _balance = balance;
+        _recent = transactions.take(3).toList();
         _loading = false;
       });
     } catch (e) {
@@ -44,13 +51,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  // Sum of all transactions — placeholder balance calculation.
-  double get _totalSpent =>
-      _transactions.fold(0.0, (sum, t) => sum + t.amount);
-
-  // Top 3 most recent transactions for the dashboard preview.
-  List<Transaction> get _recent => _transactions.take(3).toList();
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -61,13 +61,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _loadTransactions,
+            onPressed: _loadDashboard,
           ),
         ],
       ),
       body: RefreshIndicator(
         color: Colors.green,
-        onRefresh: _loadTransactions,
+        onRefresh: _loadDashboard,
         child: _buildBody(),
       ),
     );
@@ -85,7 +85,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(height: 12),
           Center(
             child: TextButton(
-              onPressed: _loadTransactions,
+              onPressed: _loadDashboard,
               child: const Text('Retry'),
             ),
           ),
@@ -96,7 +96,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // Total spent card
         Container(
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
@@ -110,17 +109,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 style: TextStyle(fontSize: 14, color: Colors.white70)),
               const SizedBox(height: 4),
               Text(
-                '\$${_totalSpent.toStringAsFixed(2)}',
+                '\$${(_balance ?? 0).toStringAsFixed(2)}',
                 style: const TextStyle(
                   fontSize: 40,
                   fontWeight: FontWeight.bold,
                   color: Colors.white,
                 ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '${_transactions.length} transactions',
-                style: const TextStyle(fontSize: 12, color: Colors.white70),
               ),
             ],
           ),
