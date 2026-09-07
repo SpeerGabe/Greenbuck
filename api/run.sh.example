@@ -1,0 +1,5 @@
+#!/bin/bash
+export SECRET_KEY="your-secret-key-here"
+export DB_USER="your-db-user"
+export DB_PASSWORD="your-db-password"
+uvicorn main:app --host 0.0.0.0 --port 8000 --ssl-keyfile key.pem --ssl-certfile cert.pem
