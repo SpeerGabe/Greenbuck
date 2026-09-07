@@ -84,6 +84,3 @@ run.sh
 capture/data/
 *.pcap
 markers.jsonl
-
-# Backend infrastructure with hardcoded secrets (commit later, scrubbed)
-capture/run_capture.py
