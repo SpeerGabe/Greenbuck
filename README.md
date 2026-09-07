@@ -23,7 +23,7 @@ The backend, database, and capture point are co-located on the Pi to keep the si
 ## Repository Structure
 
 ```
-Greenbuck/                  (repo root — the Flutter app lives here)
+Greenbuck/
 ├── lib/                    Flutter client source (screens, services, models)
 ├── integration_test/       Integration tests that drive captured actions
 ├── pubspec.yaml            Flutter dependencies
