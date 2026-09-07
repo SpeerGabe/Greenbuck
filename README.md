@@ -32,6 +32,10 @@ Greenbuck/                  (repo root — the Flutter app lives here)
 │   ├── requirements.txt
 │   ├── schema.sql
 │   └── run.sh.example
+├── capture/                Capture orchestration
+│   ├── run_capture.py      Runs one capture end to end
+│   └── data/               Captured pcaps + markers.jsonl (gitignored)
+├── .env.example            Template for environment variables
 └── README.md
 ```
 
@@ -39,9 +43,10 @@ Greenbuck/                  (repo root — the Flutter app lives here)
 
 ## Setting Up Your Own Instance
 
-You do **not** need a Raspberry Pi. You run your own local copy of the backend
-and database for development. The Pi is only used for the actual research data
-collection.
+You do **not** need a Raspberry Pi to develop the app and backend. You run your
+own local copy of the backend and database for development. A Raspberry Pi (or a
+comparable dedicated Linux host) is only needed to reproduce the actual capture
+and data-collection setup.
 
 ### Prerequisites
 - Python 3.11+
@@ -81,27 +86,38 @@ collection.
    ```
    (The schema grants table access to `greenbuck_user`, so that user must exist first.)
 
-5. **Set your secrets.** Copy the example launch script and fill in your own values:
-   ```
-   cp run.sh.example run.sh
-   ```
-   Edit `run.sh` and set:
-   - `SECRET_KEY` — any long random string
-     (generate one with `python -c "import secrets; print(secrets.token_hex(32))"`)
-   - `DB_USER` — `greenbuck_user`
-   - `DB_PASSWORD` — the password you chose above
+5. **Provide the backend's secrets.** The backend reads `SECRET_KEY`, `DB_USER`,
+   and `DB_PASSWORD` from the environment — they are never hardcoded. There are
+   two equivalent ways to set them:
 
-   `run.sh` holds your secrets and is gitignored — never commit it.
+   - **Using a `.env` file (recommended if you have internet):** install
+     `python-dotenv` (`pip install python-dotenv`), copy `../.env.example` to a
+     `.env` file, and fill in your values. The backend loads it automatically.
+   - **Using a shell script (works offline, no extra package):** copy the
+     included template and edit it:
+     ```
+     cp run.sh.example run.sh
+     ```
+     Set in `run.sh`:
+     - `SECRET_KEY` — any long random string
+       (generate one with `python -c "import secrets; print(secrets.token_hex(32))"`)
+     - `DB_USER` — `greenbuck_user`
+     - `DB_PASSWORD` — the password you chose above
+
+   Both `.env` and `run.sh` hold secrets and are gitignored — never commit them.
 
 6. **Run the backend:**
    ```
    chmod +x run.sh
    ./run.sh
    ```
+   (Or, if using a `.env` file, launch uvicorn directly:
+   `uvicorn main:app --host 0.0.0.0 --port 8000`.)
+
    For local development you can run without TLS by removing the
-   `--ssl-keyfile`/`--ssl-certfile` flags from `run.sh` (the TLS certificates are
-   not included in the repo — they are specific to the research Pi). Without those
-   flags the server runs on plain HTTP, which is fine for app development.
+   `--ssl-keyfile`/`--ssl-certfile` flags (the TLS certificates are not included
+   in the repo — they are specific to the research Pi). Without those flags the
+   server runs on plain HTTP, which is fine for app development.
 
 ### Frontend Setup
 
@@ -133,6 +149,32 @@ log in with those credentials. Admin accounts are assigned manually in the datab
 UPDATE users SET role = 'admin' WHERE username = 'your-username';
 ```
 
+### Running Captures (Data Collection)
+
+Captures run from your dev machine and require a reachable Raspberry Pi running
+the backend. The orchestrator starts tcpdump on the Pi, triggers a user action
+through the Flutter integration test, stops the capture, and pulls the resulting
+`.pcap` back to your machine.
+
+1. **Set the Pi connection details.** Copy `.env.example` to `.env` at the repo
+   root and fill in your Pi's details:
+   ```
+   PI_HOST=your-pi-ip
+   PI_USER=your-pi-username
+   PI_PASS=your-pi-password
+   PI_INTERFACE=eth0
+   ```
+   (`run_capture.py` loads these via `python-dotenv`; the real `.env` is gitignored.)
+
+2. **Run a capture.** With the backend running on the Pi and an Android emulator
+   (or device) active:
+   ```
+   python capture/run_capture.py --action check_balance --platform android --encryption none --mitigation none --run 1
+   ```
+
+Captured `.pcap` files and the `markers.jsonl` log are written to `capture/data/`,
+which is gitignored — raw capture data is not committed.
+
 ---
 
 ## Research Design
@@ -140,9 +182,14 @@ UPDATE users SET role = 'admin' WHERE username = 'your-username';
 - **Actions (6):** login, logout, register, view history, make transfer, check balance
 - **Mitigations:** none (control), and defenses grouped by class —
   packet-level padding vs. random padding (size), batching vs. constant-rate
-  response (timing)
-- **Encryption:** multiple field-level cipher configurations, treated as a
-  controlled variable
+  response (timing).
+  *(Planned design. The current capture code implements an earlier mitigation set
+  — response padding, jitter, and constant-rate — and is being extended to the
+  class-based set above.)*
+- **Encryption:** multiple field-level cipher configurations (AES-GCM,
+  ChaCha20-Poly1305, AES-256-CBC), treated as a controlled variable. *(The
+  field-level encryption layer is in active development; the capture tool accepts
+  these options now.)*
 - **Analysis:** supervised classification (Random Forest, k-NN) on features
   extracted from captured traffic
 - **Primary result:** a privacy-utility tradeoff curve — each mitigation's
@@ -156,3 +203,4 @@ UPDATE users SET role = 'admin' WHERE username = 'your-username';
 - **Jose Hipolito** — encryption implementation and backend/application development
 
 ---
+
