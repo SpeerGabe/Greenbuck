@@ -78,6 +78,7 @@ Runner/GeneratedPluginRegistrant.*
 *.env
 key.pem
 cert.pem
+run.sh
 
 # Capture data — too large / raw research data
 capture/data/
