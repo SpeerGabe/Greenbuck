@@ -20,7 +20,7 @@ class ApiService {
     HttpClient()
       ..badCertificateCallback = ((cert, host, port) => true)
       ..maxConnectionsPerHost = 1
-      ..idleTimeout = const Duration(milliseconds: 100),
+      ..idleTimeout = const Duration(milliseconds: 500),
   );
 
   // Research config — controlled by the Settings screen.
