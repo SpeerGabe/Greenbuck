@@ -7,7 +7,7 @@
 
 # ---- Imports ----
 from contextlib import asynccontextmanager # For the lifespan context manager
-from fastapi import FastAPI, HTTPException, Request # Web framework, error handling, request access
+from fastapi import FastAPI, HTTPException, Request, Response # Web framework, error handling, request access
 from pydantic import BaseModel # Request body validation via type hints
 from typing import Optional # For nullable fields
 from datetime import datetime, timezone, timedelta # Timestamps for the timing log
@@ -24,6 +24,15 @@ from argon2 import PasswordHasher  # Argon2id password hashing
 from argon2.exceptions import VerifyMismatchError  # Raised on wrong password
 from fastapi import Depends  # For the auth dependency on protected routes
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials  # Bearer token extraction
+import secrets       # generates the random IV
+import base64        # encodes IV/ciphertext for JSON
+from typing import Protocol # Defines the interface for cipher schemes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF # Key derivation function for AES key derivation
+from cryptography.hazmat.primitives import hashes, padding as sym_padding # Cryptographic primitives for hashing and padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # Cryptographic primitives for symmetric encryption
+import json # For serializing the encryption envelope to JSON
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey # X25519 key exchange for shared secret derivation
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat # For serializing public keys to bytes for transmission
 # ---- Logging Setup ----
 # Configure Python's logger so we can write info and error messages
 # that show up in the uvicorn console.
@@ -90,6 +99,10 @@ async def get_current_user(
 # inside the lifespan function below. Shared across all routes.
 pool: Optional[asyncpg.Pool] = None
 
+# ---- Session Keys (Global) ----
+# This holds the shared secret for each user session. In a real deployment, this would be stored in a secure session store or database, not in memory. For research purposes on an isolated network, we keep it simple.
+session_keys: dict[str, dict] = {}
+
 
 # ---- Lifespan: Startup and Shutdown Hooks ----
 # FastAPI calls this once when the server starts and once when it
@@ -118,6 +131,28 @@ async def lifespan(app: FastAPI):
 
 # ---- FastAPI App Instance ----
 app = FastAPI(lifespan=lifespan)
+
+# ---- Request Body Override Helper ----
+async def _set_body(request: Request, body: bytes):
+    # overrides the request's body stream so downstream handler see the decrypted plaintext
+    request._body = body
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    request._receive = receive
+
+async def _username_from_token(request: Request) -> Optional[str]:
+    # extracts the username from the Bearer token in the request headers
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:]  # Remove "Bearer " prefix
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        return username
+    except jwt.InvalidTokenError:
+        return None
 
 # ============================================================
 # Mitigation Middleware
@@ -247,7 +282,62 @@ async def timing_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     return response
 
+# ============================================================
+# Encryption Middleware
+# Decrypts incoming request bodies if the X-Encryption header is set.
+# ============================================================
+@app.middleware("http")
+async def encryption_middleware(request: Request, call_next):
+    scheme_name = request.headers.get("X-Encryption", "none")
 
+    if scheme_name == "none" or scheme_name not in CIPHER_SCHEMES:
+        return await call_next(request)
+
+    scheme = CIPHER_SCHEMES.get(scheme_name)
+    
+    username = await _username_from_token(request)
+    if not username or username not in session_keys:
+        return await call_next(request)
+
+    keys = session_keys[username].get(scheme_name)
+    if not keys:
+        return await call_next(request)
+
+    raw_body = await request.body()
+    if raw_body:
+        try:
+            envelope = json.loads(raw_body)
+            plaintext = scheme.decrypt(envelope, keys)
+            await _set_body(request, plaintext)
+        except Exception as e:
+            logger.error(f"Decryption failed ({scheme_name}): {e}")
+            raise HTTPException(status_code=400, detail="Decryption failed")
+        
+    response = await call_next(request)
+
+    if response.status_code >=400:
+        return response
+    
+    response_body = b""
+    async for chunk in response.body_iterator:
+        response_body += chunk
+
+    if response_body:
+        try:
+            response_envelope = scheme.encrypt(response_body, keys)
+            encrypted_response = json.dumps(response_envelope).encode("utf-8")
+
+            return Response(
+                content = encrypted_response,
+                status_code = response.status_code,
+                headers = {k: v for k, v in response.headers.items() if k.lower() !="content-length"},
+                media_type = "application/json"
+            )
+        except Exception as e:
+            logger.error(f"Response encryption failed ({scheme_name}): {e}")
+            raise HTTPException(status_code=500, detail="Response encryption error")
+    return response
+        
 
 
 # ---- Data Models ----
@@ -266,6 +356,7 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    client_public_key: Optional[str] = None  # Base64-encoded X25519 public key for shared secret derivation
 
 # ============================================================
 # Routes
@@ -366,7 +457,22 @@ async def login(req: LoginRequest):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         token = create_access_token(req.username)
-        return {"access_token": token, "token_type": "bearer"}
+        result = {"access_token": token, "token_type": "bearer"}
+
+        if req.client_public_key:
+            client_public_bytes = base64.b64decode(req.client_public_key)
+            client_public_key = X25519PublicKey.from_public_bytes(client_public_bytes)
+
+            server_private_key = X25519PrivateKey.generate()
+            shared_secret = server_private_key.exchange(client_public_key)
+
+            derived_keys = {name: scheme.derive_keys(shared_secret) for name, scheme in CIPHER_SCHEMES.items()}
+            session_keys[req.username] = derived_keys
+
+            server_public_bytes = server_private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            result["server_public_key"] = base64.b64encode(server_public_bytes).decode()
+        
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -396,3 +502,70 @@ async def get_balance(user: str = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"GET /balance failed: {e}")
         raise HTTPException(status_code=500, detail="Database error")
+
+# ============================================================
+# Encryption Schemes
+# ============================================================
+
+# TODO:
+# implement AES-GCM and ChaCha20-Poly1305 schemes for authenticated encryption.
+
+class CipherScheme(Protocol):
+    """Defines the interface for encryption schemes. Each scheme must implement
+    key derivation, encryption, and decryption methods."""
+
+    def derive_keys(self, shared_secret: bytes) -> dict:
+        """Derive encryption keys from a shared secret."""
+        ...
+
+    def encrypt(self, plaintext: bytes, keys: dict) -> bytes:
+        """Encrypt plaintext using the derived keys."""
+        ...
+
+    def decrypt(self, envelope: dict, keys: dict) -> bytes:
+        """Decrypt ciphertext using the derived keys."""
+        ...
+
+# aes-cbc scheme implementation. Uses HKDF to derive a 256-bit AES key from the shared secret.
+class Aes256CbcScheme(CipherScheme):
+    def derive_keys(self, shared_secret: bytes) -> dict:
+        derived = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"greenbuck-aes-cbc",
+        ).derive(shared_secret)
+        return {"aes_key": derived}
+
+    def encrypt(self, plaintext: bytes, keys: dict) -> dict:
+        iv = secrets.token_bytes(16)
+        # Pad plaintext to a multiple of 16 bytes since AES-CBC requires block alignment. Use PKCS7 padding.
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+
+        encryptor = Cipher(algorithms.AES(keys["aes_key"]), modes.CBC(iv)).encryptor()
+        ciphertext = encryptor.update(padded) + encryptor.finalize()
+        
+        envelope = {
+            "iv": base64.b64encode(iv).decode(),
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+        }
+        return envelope
+    
+    def decrypt(self, envelope: dict, keys: dict) -> bytes:
+        
+        iv = base64.b64decode(envelope["iv"])
+        ciphertext = base64.b64decode(envelope["ciphertext"])
+        decryptor = Cipher(algorithms.AES(keys["aes_key"]), modes.CBC(iv)).decryptor()
+        padded = decryptor.update(ciphertext) + decryptor.finalize()
+        
+        # Remove PKCS7 padding
+        unpadder = sym_padding.PKCS7(128).unpadder()
+        plaintext = unpadder.update(padded) + unpadder.finalize()
+        return plaintext
+
+CIPHER_SCHEMES: dict[str, CipherScheme] = {
+    "aescbc": Aes256CbcScheme(),
+    # "aes-gcm": AesGcmScheme(),  # To be implemented
+    # "chacha20-poly1305": ChaCha20Poly1305Scheme(),
+}
