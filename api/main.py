@@ -518,7 +518,7 @@ class CipherScheme(Protocol):
         """Derive encryption keys from a shared secret."""
         ...
 
-    def encrypt(self, plaintext: bytes, keys: dict) -> bytes:
+    def encrypt(self, plaintext: bytes, keys: dict) -> dict:
         """Encrypt plaintext using the derived keys."""
         ...
 
