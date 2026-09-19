@@ -289,6 +289,10 @@ async def timing_middleware(request: Request, call_next):
 # ============================================================
 @app.middleware("http")
 async def encryption_middleware(request: Request, call_next):
+    # whitelist of path that are sent by plaintext
+    if request.url.path in ("/auth/login", "/auth/register", "/auth/logout"):
+        return await call_next(request)
+    
     scheme_name = request.headers.get("X-Encryption", "none")
 
     if scheme_name == "none" or scheme_name not in CIPHER_SCHEMES:
