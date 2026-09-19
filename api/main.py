@@ -601,6 +601,14 @@ class AesGcmScheme(CipherScheme):
 
         return plaintext
 
+class ChaCha20Poly1305Scheme(CipherScheme):
+    def derive_keys(self, shared_secret: bytes) -> dict:
+        return
+    def encrypt(self, plaintext: bytes, keys: dict) ->dict:
+        return
+    def decrypt(self, envelope: dict, keys: dict) ->bytes:
+        return
+
 CIPHER_SCHEMES: dict[str, CipherScheme] = {
     "aescbc": Aes256CbcScheme(),
     "aesgcm": AesGcmScheme(),
