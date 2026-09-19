@@ -29,7 +29,8 @@ import base64        # encodes IV/ciphertext for JSON
 from typing import Protocol # Defines the interface for cipher schemes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF # Key derivation function for AES key derivation
 from cryptography.hazmat.primitives import hashes, padding as sym_padding # Cryptographic primitives for hashing and padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # Cryptographic primitives for symmetric encryption
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # Cryptographic primitives for symmetric encryption with AES-256-CDC
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305 # for implementing AES-256-GCM and ChaCha20
 import json # For serializing the encryption envelope to JSON
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey # X25519 key exchange for shared secret derivation
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat # For serializing public keys to bytes for transmission
@@ -564,8 +565,40 @@ class Aes256CbcScheme(CipherScheme):
         plaintext = unpadder.update(padded) + unpadder.finalize()
         return plaintext
 
+class AesGcmScheme(CipherScheme):
+    def derive_keys(self, shared_secret: bytes) -> dict:
+        derived = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"greenbuck-aes-gcm"
+        ).derive(shared_secret)
+        return {"aes_key": derived}
+
+    def encrypt(self, plaintext: bytes, keys: dict) -> dict:
+        nonce = secrets.token_bytes(12)
+
+        aesgcm = AESGCM(keys["aes_key"])
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+
+        envelope = {
+            "nonce": base64.b64encode(nonce).decode(),
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+        }
+
+        return envelope
+
+    def decrypt(self, envelope: dict, keys: dict) -> bytes:
+        nonce = base64.b64decode(envelope["nonce"])
+        ciphertext = base64.b64decode(envelope["ciphertext"])
+
+        aesgcm = AESGCM(keys["aes_key"])
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+
+        return plaintext
+
 CIPHER_SCHEMES: dict[str, CipherScheme] = {
     "aescbc": Aes256CbcScheme(),
-    # "aes-gcm": AesGcmScheme(),  # To be implemented
+    "aesgcm": AesGcmScheme(),
     # "chacha20-poly1305": ChaCha20Poly1305Scheme(),
 }

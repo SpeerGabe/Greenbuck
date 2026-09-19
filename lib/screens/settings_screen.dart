@@ -64,6 +64,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _setEncryption(String v) {
     setState(() => _encryption = v);
     _apiService.encryption = v;
+    _apiService.encryptionService.setActiveScheme(v);
   }
 
   void _setMitigation(String v) {
