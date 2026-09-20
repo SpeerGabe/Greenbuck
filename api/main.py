@@ -603,14 +603,37 @@ class AesGcmScheme(CipherScheme):
 
 class ChaCha20Poly1305Scheme(CipherScheme):
     def derive_keys(self, shared_secret: bytes) -> dict:
-        return
+        derived = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"greenbuck-chacha20-poly1305",
+        ).derive(shared_secret)
+        return {"key": derived}
+    
     def encrypt(self, plaintext: bytes, keys: dict) ->dict:
-        return
+        nonce = secrets.token_bytes(12)
+
+        chacha=ChaCha20Poly1305(keys["key"])
+        ciphertext = chacha.encrypt(nonce, plaintext, None)
+
+        envelope = {
+            "nonce": base64.b64encode(nonce).decode(),
+            "ciphertext": base64.b64encode(ciphertext).decode() 
+        }
+
+        return envelope
+
     def decrypt(self, envelope: dict, keys: dict) ->bytes:
-        return
+        nonce = base64.b64decode(envelope["nonce"])
+        ciphertext = base64.b64decode(envelope["ciphertext"])
+
+        chacha = ChaCha20Poly1305(keys["key"])
+        plaintext = chacha.decrypt(nonce, ciphertext, None)
+        return plaintext
 
 CIPHER_SCHEMES: dict[str, CipherScheme] = {
     "aescbc": Aes256CbcScheme(),
     "aesgcm": AesGcmScheme(),
-    # "chacha20-poly1305": ChaCha20Poly1305Scheme(),
+    "chacha20": ChaCha20Poly1305Scheme(),
 }

@@ -5,7 +5,7 @@ import 'package:cryptography/cryptography.dart' as crypto;
 import 'crypto/cipher_scheme.dart';
 import 'crypto/aes_cbc_scheme.dart';
 import 'crypto/aes_gcm_scheme.dart';
-//import 'crypto/chacha20_scheme.dart';
+import 'crypto/chacha20_scheme.dart';
 
 class EncryptionService {
   final _x25519 = crypto.X25519();
@@ -15,7 +15,7 @@ class EncryptionService {
   final Map<String, CipherScheme> availableSchemes = {
     "aescbc": AesCbcScheme(),
     "aesgcm": AesGcmScheme(),
-    //"chacha20": ChaCha20Scheme()
+    "chacha20": ChaCha20Scheme()
   };
 
   String activeSchemeName = "aescbc";
