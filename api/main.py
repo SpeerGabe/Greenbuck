@@ -380,7 +380,8 @@ async def get_transactions(user: str = Depends(get_current_user)):
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, amount, category, timestamp, merchant FROM transactions ORDER BY id DESC"
+                "SELECT id, amount, category, timestamp, merchant FROM transactions WHERE username = $1 ORDER BY id DESC",
+                user,
             )
            # Convert asyncpg Records to plain dicts for clean JSON output.
             return {
@@ -407,14 +408,15 @@ async def create_transaction(transaction: Transaction, user: str = Depends(get_c
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO transactions (amount, category, timestamp, merchant)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO transactions (amount, category, timestamp, merchant, username)
+                VALUES ($1, $2, $3, $4, $5)
                 RETURNING id, amount, category, timestamp, merchant
                 """,
                 transaction.amount,
                 transaction.category,
                 transaction.timestamp,
                 transaction.merchant,
+                user,
             )
             return {
                 "id": row["id"],
@@ -498,7 +500,8 @@ async def get_balance(user: str = Depends(get_current_user)):
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions"
+                "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE username = $1",
+                user,
             )
             return {
                 "balance": float(row["total"]),

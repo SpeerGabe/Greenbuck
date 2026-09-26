@@ -57,7 +57,8 @@ CREATE TABLE public.transactions (
     amount numeric(10,2) NOT NULL,
     category character varying(50) NOT NULL,
     "timestamp" character varying(30) NOT NULL,
-    merchant character varying(100)
+    merchant character varying(100),
+    username character varying(50) REFERENCES public.users(username)
 );
 
 ALTER TABLE public.transactions OWNER TO postgres;
