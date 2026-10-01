@@ -12,7 +12,10 @@ class ApiService {
   factory ApiService() => _instance;
   ApiService._internal();
 
-  static const String baseUrl = 'https://192.168.0.149:8000';
+  static const String baseUrl = String.fromEnvironment(
+  'BASE_URL',
+  defaultValue: 'https://192.168.1.100:8000',
+  );
   
   // Singleton instance of the EncryptionService for handling encryption and decryption.
   final EncryptionService encryptionService = EncryptionService();

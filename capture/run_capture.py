@@ -70,6 +70,7 @@ def trigger_flutter_test(action, encryption, mitigation, platform):
         f'--dart-define=ENCRYPTION={encryption} '
         f'--dart-define=MITIGATION={mitigation} '
         f'--dart-define=PLATFORM={platform}'
+        f'--dart-define=BASE_URL={BASE_URL}'
     )
     result = subprocess.run(
         cmd, cwd=project_root, capture_output=True, text=True,
