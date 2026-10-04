@@ -19,6 +19,7 @@ void main() {
   testWidgets('Trigger research action: $action', (tester) async {
     final api = ApiService();
     api.encryption = encryption;
+    api.encryptionService.setActiveScheme(encryption);
     api.mitigation = mitigation;
     api.platform = platform;
     api.mode = encryption == 'none' ? 'systemA' : 'systemB';
@@ -30,6 +31,7 @@ void main() {
       case 'login':
         await tester.tap(find.text('Login'));
         await tester.pumpAndSettle(const Duration(seconds: 4));
+        expect(find.text('Login'), findsNothing);
         break;
 
       case 'view_history':
@@ -37,6 +39,7 @@ void main() {
         await tester.pumpAndSettle(const Duration(seconds: 4));
         await tester.tap(find.text('Transactions'));
         await tester.pumpAndSettle(const Duration(seconds: 3));
+        expect(find.text('Failed to load'), findsNothing);
         break;
 
       case 'make_transfer':
@@ -49,6 +52,7 @@ void main() {
         await tester.enterText(find.byType(TextField).first, '50.00');
         await tester.tap(find.text('Add Transaction').last);
         await tester.pumpAndSettle(const Duration(seconds: 3));
+        expect(find.text('50.00'), findsWidgets);
         break;
 
       case 'check_balance':

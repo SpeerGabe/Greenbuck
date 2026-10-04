@@ -24,6 +24,7 @@ from argon2 import PasswordHasher  # Argon2id password hashing
 from argon2.exceptions import VerifyMismatchError  # Raised on wrong password
 from fastapi import Depends  # For the auth dependency on protected routes
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials  # Bearer token extraction
+from fastapi.responses import JSONResponse # For returning JSON error responses
 import secrets       # generates the random IV
 import base64        # encodes IV/ciphertext for JSON
 from typing import Protocol # Defines the interface for cipher schemes
@@ -50,6 +51,10 @@ TOKEN_EXPIRE_MINUTES = 30           # Access tokens expire after 30 minutes
 
 # Argon2id password hasher (OWASP-recommended defaults).
 ph = PasswordHasher()
+
+# dummy password hash for timing attack mitigation. 
+# This makes sure that the time taken to verify a password is roughly the same no matter whether the user exists or not
+DUMMY_PASSWORD_HASH = ph.hash(secrets.token_hex(32)) # random 32-byte string hashed with Argon2id
 
 # HTTPBearer extracts the "Authorization: Bearer <token>" header.
 # auto_error=False lets us return our own 401 messages.
@@ -229,6 +234,68 @@ async def mitigation_middleware(request: Request, call_next):
     return response
 
 # ============================================================
+# Encryption Middleware
+# Decrypts incoming request bodies if the X-Encryption header is set.
+# ============================================================
+@app.middleware("http")
+async def encryption_middleware(request: Request, call_next):
+    # whitelist of path that are sent by plaintext
+    if request.url.path in ("/auth/login", "/auth/register", "/auth/logout"):
+        return await call_next(request)
+    
+    scheme_name = request.headers.get("X-Encryption", "none")
+
+    if scheme_name == "none" or scheme_name not in CIPHER_SCHEMES:
+        return await call_next(request)
+
+    scheme = CIPHER_SCHEMES.get(scheme_name)
+    if scheme_name not in CIPHER_SCHEMES:
+        return JSONResponse(status_code=400, content={"detail": f"Unsupported encryption scheme: {scheme_name}"})
+    
+    username = await _username_from_token(request)
+    if not username or username not in session_keys:
+        return JSONResponse(status_code=401, content={"detail": "No encryption session established: please login again"})
+
+    keys = session_keys[username].get(scheme_name)
+    if not keys:
+        return JSONResponse(status_code=401, content={"detail": f"No session keys for scheme: {scheme_name}"})
+
+    raw_body = await request.body()
+    if raw_body:
+        try:
+            envelope = json.loads(raw_body)
+            plaintext = scheme.decrypt(envelope, keys)
+            await _set_body(request, plaintext)
+        except Exception as e:
+            logger.error(f"Decryption failed ({scheme_name}): {e}")
+            return JSONResponse(status_code=400, content={"detail": "Decryption failed"})
+        
+    response = await call_next(request)
+
+    if response.status_code >=400:
+        return response
+    
+    response_body = b""
+    async for chunk in response.body_iterator:
+        response_body += chunk
+
+    if response_body:
+        try:
+            response_envelope = scheme.encrypt(response_body, keys)
+            encrypted_response = json.dumps(response_envelope).encode("utf-8")
+
+            return Response(
+                content = encrypted_response,
+                status_code = response.status_code,
+                headers = {k: v for k, v in response.headers.items() if k.lower() !="content-length"},
+                media_type = "application/json"
+            )
+        except Exception as e:
+            logger.error(f"Response encryption failed ({scheme_name}): {e}")
+            return JSONResponse(status_code=500, content={"detail": "Response encryption error"})
+    return response
+
+# ============================================================
 # Timing Log Middleware
 # Stamps every request with research metadata and writes a row
 # to the timing_log table. This is the primary research dataset.
@@ -281,66 +348,6 @@ async def timing_middleware(request: Request, call_next):
 
     # Echo request_id back in response for capture linkage
     response.headers["X-Request-ID"] = request_id
-    return response
-
-# ============================================================
-# Encryption Middleware
-# Decrypts incoming request bodies if the X-Encryption header is set.
-# ============================================================
-@app.middleware("http")
-async def encryption_middleware(request: Request, call_next):
-    # whitelist of path that are sent by plaintext
-    if request.url.path in ("/auth/login", "/auth/register", "/auth/logout"):
-        return await call_next(request)
-    
-    scheme_name = request.headers.get("X-Encryption", "none")
-
-    if scheme_name == "none" or scheme_name not in CIPHER_SCHEMES:
-        return await call_next(request)
-
-    scheme = CIPHER_SCHEMES.get(scheme_name)
-    
-    username = await _username_from_token(request)
-    if not username or username not in session_keys:
-        return await call_next(request)
-
-    keys = session_keys[username].get(scheme_name)
-    if not keys:
-        return await call_next(request)
-
-    raw_body = await request.body()
-    if raw_body:
-        try:
-            envelope = json.loads(raw_body)
-            plaintext = scheme.decrypt(envelope, keys)
-            await _set_body(request, plaintext)
-        except Exception as e:
-            logger.error(f"Decryption failed ({scheme_name}): {e}")
-            raise HTTPException(status_code=400, detail="Decryption failed")
-        
-    response = await call_next(request)
-
-    if response.status_code >=400:
-        return response
-    
-    response_body = b""
-    async for chunk in response.body_iterator:
-        response_body += chunk
-
-    if response_body:
-        try:
-            response_envelope = scheme.encrypt(response_body, keys)
-            encrypted_response = json.dumps(response_envelope).encode("utf-8")
-
-            return Response(
-                content = encrypted_response,
-                status_code = response.status_code,
-                headers = {k: v for k, v in response.headers.items() if k.lower() !="content-length"},
-                media_type = "application/json"
-            )
-        except Exception as e:
-            logger.error(f"Response encryption failed ({scheme_name}): {e}")
-            raise HTTPException(status_code=500, detail="Response encryption error")
     return response
         
 
@@ -458,10 +465,15 @@ async def login(req: LoginRequest):
                 "SELECT username, password_hash FROM users WHERE username = $1",
                 req.username,
             )
-        # Same generic error whether the user is missing or the password is
-        # wrong — avoids leaking which usernames exist.
-        if row is None or not verify_password(req.password, row["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        if row is not None:
+            password_valid = verify_password(req.password, row["password_hash"])
+        else:
+            verify_password(req.password, DUMMY_PASSWORD_HASH)
+            password_valid = False
+
+        if row is None or not password_valid:
+            raise HTTPException(status_code=401, detail="Invalid credientials")
 
         token = create_access_token(req.username)
         result = {"access_token": token, "token_type": "bearer"}
