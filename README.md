@@ -199,8 +199,8 @@ which is gitignored — raw capture data is not committed.
 
 ## Team
 
-- **Gabriel Speer** — security architecture, threat model, mitigations, data analysis
-- **Jose Hipolito** — encryption implementation and backend/application development
+- **Gabriel Speer** — security architecture, threat model, mitigations, data analysis, back end
+- **Jose Hipolito** — encryption implementation and application development
 
 ---
 
