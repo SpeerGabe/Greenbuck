@@ -199,8 +199,8 @@ which is gitignored — raw capture data is not committed.
 
 ## Team
 
-- **Gabriel Speer** — security architecture, threat model, mitigations, data analysis, back end
-- **Jose Hipolito** — encryption implementation and application development
+- **Gabriel Speer** — security architecture, threat model, Flutter client, FastAPI backend and database, capture pipeline, mitigations, data analysis
+- **Jose Hipolito** — field-level encryption (AES-256-CBC, AES-GCM, ChaCha20-Poly1305) on client and server, X25519 key exchange, encryption middleware, security hardening
 
 ---
 
