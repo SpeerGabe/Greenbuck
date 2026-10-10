@@ -5,6 +5,7 @@ import 'package:http/io_client.dart';
 import 'package:http/http.dart' as http;
 import '../models/transaction.dart';
 import 'encryption_service.dart';
+import 'mitigation_service.dart';
 
 class ApiService {
   // Singleton — shared state across every screen.
@@ -20,6 +21,9 @@ class ApiService {
   // Singleton instance of the EncryptionService for handling encryption and decryption.
   final EncryptionService encryptionService = EncryptionService();
 
+  // Singleton instance of the MitigationService for handling mitigation schemes.
+  final MitigationService mitigationService = MitigationService();
+
   // Custom HTTP client that accepts the backend's self-signed certificate.
   // Research instrument on an isolated network — in production you would
   // use a CA-signed cert and never bypass verification.
@@ -32,14 +36,26 @@ class ApiService {
 
   // Research config — controlled by the Settings screen.
   String mode = 'systemA';
-  String encryption = 'none';
-  String mitigation = 'none';
+  //mitigation and encryption are set to 'none' by default, but can be changed via the Settings screen.
+  // setter and getter for mitigation and encryption are provided to update the active scheme in the respective services.
+  String _encryption = 'none';
+  String get encryption => _encryption;
+  set encryption(String value) {
+    encryptionService.setActiveScheme(value);
+    _encryption = value;
+  }
+  String _mitigation = 'none';
+  String get mitigation => _mitigation;
+  set mitigation(String value) {
+    mitigationService.setActiveScheme(value);
+    _mitigation = value;
+  }
   String platform = 'android';
   String? authToken;
 
   // Build the research headers sent with every request.
   // X-Request-ID is generated per request for capture linkage.
-Map<String, String> _headers({String? action}) {
+  Map<String, String> _headers({String? action}) {
     final headers = {
       'Content-Type': 'application/json',
       'X-Request-ID': DateTime.now().millisecondsSinceEpoch.toString(),
@@ -57,17 +73,39 @@ Map<String, String> _headers({String? action}) {
     return headers;
   }
 
+  // builds a JSON body and applies the mitigation's padding
+  String _plainBody(Map<String, dynamic> dataMap) {
+    final jsonString = jsonEncode(dataMap);
+    final shapedJson = mitigationService.activeScheme.shapeBody(jsonString);
+    return shapedJson;
+  }
+
   // prepare the request body, encrypting it if encryption is enabled.
   Future<String> _prepareRequestBody(Map<String, dynamic> dataMap) async {
-    final jsonString = jsonEncode(dataMap);
+    final shapedJson = _plainBody(dataMap);
 
     if (encryption == 'none') {
-      return jsonString;
+      return shapedJson;
     }
 
-    final envelope = await encryptionService.encryptPayload(jsonString);
+    final envelope = await encryptionService.encryptPayload(shapedJson);
     final encryptedBody = jsonEncode(envelope);
     return encryptedBody;
+  }
+
+  //runs requests between the active mitigations's before and after methods
+  Future<T> _mitigated<T>(Future<T> Function() call) async {
+    final scheme = mitigationService.activeScheme;
+    final stopwatch = Stopwatch()..start();
+
+    await scheme.beforeSend();
+    try {
+      final result = await call();
+      return result;
+    } finally {
+      // ensure failed calls get the same timing as successful calls
+      await scheme.afterResponse(stopwatch.elapsed);
+    }
   }
 
   Future<Map<String, dynamic>> _parseResponseBody(String responseBody) async {
@@ -84,7 +122,7 @@ Map<String, String> _headers({String? action}) {
 
 
   // Fetch all transactions from the backend.
-  Future<List<Transaction>> getTransactions() async {
+  Future<List<Transaction>> _getTransactions() async {
     final response = await _client
         .get(
           Uri.parse('$baseUrl/transactions'),
@@ -100,9 +138,14 @@ Map<String, String> _headers({String? action}) {
       throw Exception('Failed to load transactions: ${response.statusCode}');
     }
   }
+  // wraps the _getTransactions method with mitigation logic, so that mitigation is applied
+  Future<List<Transaction>> getTransactions() {
+    final result = _mitigated(() => _getTransactions());
+    return result;
+  }
 
   // Create a new transaction. Returns the created record with its real ID.
-  Future<Transaction> createTransaction(Transaction transaction) async {
+  Future<Transaction> _createTransaction(Transaction transaction) async {
     final requestBody = await _prepareRequestBody(transaction.toJson());
     final response = await _client
 
@@ -120,9 +163,14 @@ Map<String, String> _headers({String? action}) {
       throw Exception('Failed to create transaction: ${response.statusCode}');
     }
   }
+  // wraps the _createTransaction methed with mitigation logic, so that mitigation is applied 
+  Future<Transaction> createTransaction(Transaction transaction) {
+    final result = _mitigated(() => _createTransaction(transaction));
+    return result;
+  }
 
   // Login — produces a distinct POST pattern as a research action.
-  Future<Map<String, dynamic>> login(String username, String password) async {
+  Future<Map<String, dynamic>> _login(String username, String password) async {
     final clientPubKey = await encryptionService.generateClientPublicKey();
 
     final response = await _client
@@ -150,9 +198,13 @@ Map<String, String> _headers({String? action}) {
       throw Exception('Login failed: ${response.statusCode}');
     }
   }
-
+  // wraps the _login method with mitigation logic, so that mitigation is applied
+  Future<Map<String, dynamic>> login(String username, String password) {
+    final result = _mitigated(() => _login(username, password));
+    return result;
+  }
   // Register a new user — captured research action (6th class).
-  Future<void> register(String username, String password) async {
+  Future<void> _register(String username, String password) async {
     final response = await _client
         .post(
           Uri.parse('$baseUrl/auth/register'),
@@ -165,9 +217,14 @@ Map<String, String> _headers({String? action}) {
       throw Exception('Registration failed: ${response.statusCode}');
     }
   }
+  // wraps the _register method with mitigation logic, so that mitigation is applied
+  Future<void> register(String username, String password) {
+    final result = _mitigated(() => _register(username, password));
+    return result;
+  }
 
   // Logout — small response, distinct from other actions.
-  Future<void> logout(String token) async {
+  Future<void> _logout(String token) async {
     final response = await _client
         .post(
           Uri.parse('$baseUrl/auth/logout'),
@@ -180,9 +237,14 @@ Map<String, String> _headers({String? action}) {
       throw Exception('Logout failed: ${response.statusCode}');
     }
   }
+  // wraps the _logout method with mitigation logic, so that mitigation is applied
+  Future<void> logout(String token) {
+    final result = _mitigated(() => _logout(token));
+    return result;
+  }
 
   // Balance summary — smaller response than full transactions list.
-  Future<double> getBalance() async {
+  Future<double> _getBalance() async {
     final response = await _client
         .get(
           Uri.parse('$baseUrl/balance'),
@@ -196,5 +258,10 @@ Map<String, String> _headers({String? action}) {
     } else {
       throw Exception('Balance check failed: ${response.statusCode}');
     }
+  }
+  // wraps the _getBalance method with mitigation logic, so that mitigation is applied
+  Future<double> getBalance() {
+    final result = _mitigated(() => _getBalance());
+    return result;
   }
 }
