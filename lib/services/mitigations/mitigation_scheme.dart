@@ -8,6 +8,9 @@ Abstract class for client side traffic shaping mitigation schemes. Each mitigati
 abstract class MitigationScheme {
   String get name;
 
+  // true when requst should be queued and sent together for batching
+  bool get batchRequests => false;
+
   String shapeBody(String plaintextJson) => plaintextJson;
 
   Future<void> beforeSend() async {}

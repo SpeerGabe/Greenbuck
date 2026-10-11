@@ -8,7 +8,7 @@
 # ---- Imports ----
 from contextlib import asynccontextmanager # For the lifespan context manager
 from fastapi import FastAPI, HTTPException, Request, Response # Web framework, error handling, request access
-from pydantic import BaseModel # Request body validation via type hints
+from pydantic import BaseModel, ValidationError # Request body validation via type hints
 from typing import Optional # For nullable fields
 from datetime import datetime, timezone, timedelta # Timestamps for the timing log
 import asyncpg # Async PostgreSQL driver
@@ -230,6 +230,10 @@ async def mitigation_middleware(request: Request, call_next):
             headers={k: v for k, v in response.headers.items() if k.lower() != "content-length"},
             media_type=response.media_type,
         )
+
+    elif mitigation == "batching":
+        # batching happens in the /batch endpoint
+        return response
     # Unknown mitigation value — treat as no-op.
     return response
 
@@ -349,7 +353,79 @@ async def timing_middleware(request: Request, call_next):
     # Echo request_id back in response for capture linkage
     response.headers["X-Request-ID"] = request_id
     return response
-        
+
+# ---- Batching Middleware
+# batching requires a different approach than the other middlewares because it need to read the request body, which is a stream.
+# We will read the body, parse it as JSON, and then create a new request for each transaction in the batch.
+# each new request will be processed by the other middlewares and the route handler, and then we will collect the responses and return them as a list
+# route handling logic are pulled into helpers as a result
+async def fetch_transactions(user: str) -> dict:
+    try:
+        async with pool.acuire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, amount, category, timestamp, merchant From transactions WHERE username = $1 ORDER BY id DESC",
+                user,
+            )
+        result = {
+            "transactions": [
+                {
+                    "id": r["id"],
+                    "amount": float(r["amount"]),
+                    "category": r["category"],
+                    "timestamp": r["timestamp"],
+                    "merchant": r["merchant"],
+                }
+                for r in rows
+            ]
+        }
+        return result
+    except Exception as e:
+        logger.error(f"fetch_transactions failed: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+async def insert_transaction(user: str, transaction: Transaction) -> dict:
+    try:
+        async with pool.acuire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO transactions (amount, category, timestamp, merchant, username)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, amount, category, timestamp, merchant
+                """,
+                transaction.amount,
+                transaction.category,
+                transaction.timestamp,
+                transaction.merchant,
+                user,
+            )
+        result = {
+            "id": row["id"],
+            "amount": float(row["amount"]),
+            "category": row["category"],
+            "timestamp": row["timestamp"],
+            "merchant": row["merchant"],
+        }
+        return result
+    except Exception as e:
+        logger.error(f"insert_transaction failed: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+async def compute_balance(user: str) -> dict:
+    try:
+        async with pool.acuire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE username = $1",
+                user,
+            )
+        result = {
+            "balance": float(row["total"]),
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        }
+        return result
+    except Exception as e:
+        logger.error(f"compute_balance failed: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    
 
 
 # ---- Data Models ----
@@ -382,59 +458,14 @@ async def root():
 # Return all transactions, newest first.
 @app.get("/transactions")
 async def get_transactions(user: str = Depends(get_current_user)):
-   # Acquire a connection from the pool, automatically released
-   # when the 'async with' block exits.
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, amount, category, timestamp, merchant FROM transactions WHERE username = $1 ORDER BY id DESC",
-                user,
-            )
-           # Convert asyncpg Records to plain dicts for clean JSON output.
-            return {
-                "transactions": [
-                    {
-                        "id": r["id"],
-                        "amount": float(r["amount"]), # NUMERIC -> float
-                        "category": r["category"],
-                        "timestamp": r["timestamp"],
-                        "merchant": r["merchant"],
-                    }
-                    for r in rows
-                ]
-            }
-    except Exception as e:
-        # Log the real error server-side, return generic 500 to client.
-        logger.error(f"GET /transactions failed: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
+    result = await fetch_transactions(user)
+    return result
 
 # Create a new transaction. Returns the created record.
 @app.post("/transactions", status_code=201)
 async def create_transaction(transaction: Transaction, user: str = Depends(get_current_user)):
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO transactions (amount, category, timestamp, merchant, username)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, amount, category, timestamp, merchant
-                """,
-                transaction.amount,
-                transaction.category,
-                transaction.timestamp,
-                transaction.merchant,
-                user,
-            )
-            return {
-                "id": row["id"],
-                "amount": float(row["amount"]),
-                "category": row["category"],
-                "timestamp": row["timestamp"],
-                "merchant": row["merchant"],
-            }
-    except Exception as e:
-        logger.error(f"POST /transactions failed: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
+    result = await insert_transaction(user, transaction)
+    return result
 
 
 # Register a new user. Hashes the password with Argon2id before storing.
@@ -497,6 +528,59 @@ async def login(req: LoginRequest):
     except Exception as e:
         logger.error(f"POST /auth/login failed: {e}")
         raise HTTPException(status_code=500, detail="Login error")
+# ---- Batching Middleware ----
+# logic for batching and batching endpoint
+class BatchItem(BaseModel):
+    id: int
+    action: str
+    body: Optional[dict] = None
+
+class BatchRequest(BaseModel):
+    requests: list[BatchItem]
+
+MAX_BATCH_SIZE = 20 # sync with client
+
+async def _batch_view_history(user: str, body: Optional[dict]):
+    result = await fetch_transactions(user)
+    return 200, result
+
+async def _batch_check_balance(user: str, body: Optional[dict]):
+    result = await compute_balance(user)
+    return 200, result
+
+async def _batch_make_transfer(user: str, body: Optional[dict]):
+    transaction = Transaction(**(body or {}))
+    result = await insert_transaction(user, transaction)
+    return 201, result
+
+BATCH_ACTIONS = {
+    "view_history": _batch_view_history,
+    "check_balance": _batch_check_balance,
+    "make_transfer": _batch_make_transfer,
+}
+
+@app.post("/batch")
+async def batch(req: BatchRequest, user: str = Depends(get_current_user)):
+    if len(req.requests) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=413, detail="Batch too large")
+
+    responses = []
+
+    for item in req.requests:
+        handler = BATCH_ACTIONS.get(item.action)
+        if handler is None:
+            responses.eppend({"id": item.id, "status": 400, "body": {"detail": f"Unknown action: {item.action}"}})
+            continue
+        try:
+            status, body = await handler(user, item.body)
+        except ValidationError:
+            status, body = 422, {"detail": "Invalid request body"}
+        except HTTPException as e:
+            status, body = e.status_code, {"detail": e.detail}
+        responses.append({"id": item.id, "status": status, "body": body})
+
+    result = {"responses": responses}
+    return result
 
 
 # Logout. Stateless JWT means the server holds no session — the client
@@ -509,26 +593,8 @@ async def logout():
 # transaction list. Smaller response than /transactions for distinct traffic.
 @app.get("/balance")
 async def get_balance(user: str = Depends(get_current_user)):
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE username = $1",
-                user,
-            )
-            return {
-                "balance": float(row["total"]),
-                "as_of": datetime.now(timezone.utc).isoformat(),
-            }
-    except Exception as e:
-        logger.error(f"GET /balance failed: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
-
-# ============================================================
-# Encryption Schemes
-# ============================================================
-
-# TODO:
-# implement AES-GCM and ChaCha20-Poly1305 schemes for authenticated encryption.
+    result = await compute_balance(user)
+    return result
 
 class CipherScheme(Protocol):
     """Defines the interface for encryption schemes. Each scheme must implement

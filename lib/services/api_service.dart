@@ -6,6 +6,9 @@ import 'package:http/http.dart' as http;
 import '../models/transaction.dart';
 import 'encryption_service.dart';
 import 'mitigation_service.dart';
+import 'request_batcher.dart';
+import 'mitigations/batching_mitigation.dart';
+
 
 class ApiService {
   // Singleton — shared state across every screen.
@@ -23,6 +26,13 @@ class ApiService {
 
   // Singleton instance of the MitigationService for handling mitigation schemes.
   final MitigationService mitigationService = MitigationService();
+
+  // singleton instance of the request batcher
+  late final RequestBatcher _batcher = RequestBatcher(
+    windowMs: BatchingMitigation.windowMs,
+    maxBatchSize: BatchingMitigation.maxBatchSize,
+    sendBatch: _sendBatch,
+  );
 
   // Custom HTTP client that accepts the backend's self-signed certificate.
   // Research instrument on an isolated network — in production you would
@@ -50,6 +60,7 @@ class ApiService {
     mitigationService.setActiveScheme(value);
     _mitigation = value;
   }
+  bool get _batching => mitigationService.activeScheme.batchRequests;
   String platform = 'android';
   String? authToken;
 
@@ -123,6 +134,13 @@ class ApiService {
 
   // Fetch all transactions from the backend.
   Future<List<Transaction>> _getTransactions() async {
+
+    if(_batching) {
+      final body = await _batcher.enqueue('view_history');
+      final List<dynamic> data = body['transactions'];
+      return data.map((json) => Transaction.fromJson(json)).toList();
+    }
+
     final response = await _client
         .get(
           Uri.parse('$baseUrl/transactions'),
@@ -146,6 +164,10 @@ class ApiService {
 
   // Create a new transaction. Returns the created record with its real ID.
   Future<Transaction> _createTransaction(Transaction transaction) async {
+    if(_batching){
+      final body = await _batcher.enqueue('make_transfer', transaction.toJson());
+      return Transaction.fromJson(body);
+    }
     final requestBody = await _prepareRequestBody(transaction.toJson());
     final response = await _client
 
@@ -245,6 +267,11 @@ class ApiService {
 
   // Balance summary — smaller response than full transactions list.
   Future<double> _getBalance() async {
+    if(_batching){
+      final body = await _batcher.enqueue('check_balance');
+      return (body['balance'] as num).toDouble();
+    }
+
     final response = await _client
         .get(
           Uri.parse('$baseUrl/balance'),
@@ -263,5 +290,26 @@ class ApiService {
   Future<double> getBalance() {
     final result = _mitigated(() => _getBalance());
     return result;
+  }
+
+  // sends out a batch as a single POST and returns the per request results
+  Future<List<dynamic>> _sendBatch(List<Map<String, dynamic>> items) async {
+    final requestBody = await _prepareRequestBody({'requests': items});
+
+    final response = await _client
+      .post(
+        Uri.parse('$baseUrl/batch'),
+        headers: _headers(action: 'batch'),
+        body: requestBody,
+      )
+      .timeout(const Duration(seconds: 5));
+
+    if (response.statusCode != 200) {
+      throw Exception('Batch failed: ${response.statusCode}');
+    }
+
+    final body = await _parseResponseBody(response.body);
+    final responses = body['responses'] as List<dynamic>;
+    return responses;
   }
 }

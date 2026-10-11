@@ -185,6 +185,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _buildRadio('Response padding', 'padding', _mitigation, _setMitigation),
               _buildRadio('Timing jitter', 'jitter', _mitigation, _setMitigation),
               _buildRadio('Constant-rate', 'constant', _mitigation, _setMitigation),
+              _buildRadio('Batching', 'batching', _mitigation, _setMitigation)
             ],
           ),
         ),
