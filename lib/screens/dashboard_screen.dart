@@ -35,8 +35,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _error = null;
     });
     try {
-      final balance = await _apiService.getBalance();
-      final transactions = await _apiService.getTransactions();
+      final results = await Future.wait([_apiService.getBalance(), _apiService.getTransactions()]);
+      final balance = results[0] as double;
+      final transactions = results[1] as List<Transaction>;
+      
       setState(() {
         _balance = balance;
         _recent = transactions.take(3).toList();

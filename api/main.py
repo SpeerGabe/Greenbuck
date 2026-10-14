@@ -354,14 +354,32 @@ async def timing_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     return response
 
-# ---- Batching Middleware
+# ---- Data Models ----
+# Pydantic validates incoming JSON against these types. Missing
+# fields or wrong types cause FastAPI to return a 422 automatically.
+class Transaction(BaseModel):
+    amount: float
+    category: str
+    timestamp: str
+    merchant: Optional[str] = None
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    client_public_key: Optional[str] = None  # Base64-encoded X25519 public key for shared secret derivation
+
+# ---- Batching routing
 # batching requires a different approach than the other middlewares because it need to read the request body, which is a stream.
 # We will read the body, parse it as JSON, and then create a new request for each transaction in the batch.
 # each new request will be processed by the other middlewares and the route handler, and then we will collect the responses and return them as a list
 # route handling logic are pulled into helpers as a result
 async def fetch_transactions(user: str) -> dict:
     try:
-        async with pool.acuire() as conn:
+        async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, amount, category, timestamp, merchant From transactions WHERE username = $1 ORDER BY id DESC",
                 user,
@@ -385,7 +403,7 @@ async def fetch_transactions(user: str) -> dict:
 
 async def insert_transaction(user: str, transaction: Transaction) -> dict:
     try:
-        async with pool.acuire() as conn:
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO transactions (amount, category, timestamp, merchant, username)
@@ -412,7 +430,7 @@ async def insert_transaction(user: str, transaction: Transaction) -> dict:
 
 async def compute_balance(user: str) -> dict:
     try:
-        async with pool.acuire() as conn:
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE username = $1",
                 user,
@@ -425,26 +443,6 @@ async def compute_balance(user: str) -> dict:
     except Exception as e:
         logger.error(f"compute_balance failed: {e}")
         raise HTTPException(status_code=500, detail="Database error")
-    
-
-
-# ---- Data Models ----
-# Pydantic validates incoming JSON against these types. Missing
-# fields or wrong types cause FastAPI to return a 422 automatically.
-class Transaction(BaseModel):
-    amount: float
-    category: str
-    timestamp: str
-    merchant: Optional[str] = None
-
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    client_public_key: Optional[str] = None  # Base64-encoded X25519 public key for shared secret derivation
 
 # ============================================================
 # Routes
@@ -578,6 +576,11 @@ async def batch(req: BatchRequest, user: str = Depends(get_current_user)):
         except HTTPException as e:
             status, body = e.status_code, {"detail": e.detail}
         responses.append({"id": item.id, "status": status, "body": body})
+
+    # Log summary of requests in bundle for logging
+    actions = [item.action for item in req.requests]
+    statuses = [response["status"] for response in responses]
+    logger.info(f"BATCH user={user} size={len(actions)} action={actions} statuses = {statuses}")
 
     result = {"responses": responses}
     return result

@@ -1,4 +1,6 @@
 // service that handles the mitigation schemes and tracks which one is active
+import 'package:greenbuck/services/mitigations/batching_mitigation.dart';
+
 import 'mitigations/mitigation_scheme.dart';
 import 'mitigations/constant_mitigation.dart';
 import 'mitigations/jitter_mitigation.dart';
@@ -11,6 +13,7 @@ class MitigationService {
     'jitter': JitterMitigation(),
     'none': NoMitigation(),
     'padding': PaddingMitigation(),
+    'batching': BatchingMitigation(),
   };
 
   String activeSchemeName = "none";
