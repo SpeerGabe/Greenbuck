@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:http/io_client.dart';
 import 'package:http/http.dart' as http;
 import '../models/transaction.dart';
@@ -64,12 +65,31 @@ class ApiService {
   String platform = 'android';
   String? authToken;
 
+  // Capture run ID, passed in by run_capture.py via --dart-define=RUN_ID.
+  // Same value on every request in one capture, so timing_log rows can be
+  // joined to markers.jsonl. Manual app use falls back to 'manual'.
+  static const String runId = String.fromEnvironment('RUN_ID', defaultValue: 'manual');
+
+  static final Random _rng = Random.secure();
+
+  // 128 random bits as 32 hex chars. Unique even when two requests fire in
+  // the same millisecond (the dashboard's Future.wait), and always the same
+  // length so it never changes the TLS record size.
+  static String _newRequestId() {
+    final sb = StringBuffer();
+    for (var i = 0; i < 16; i++) {
+      sb.write(_rng.nextInt(256).toRadixString(16).padLeft(2, '0'));
+    }
+    return sb.toString();
+  }
+
   // Build the research headers sent with every request.
   // X-Request-ID is generated per request for capture linkage.
   Map<String, String> _headers({String? action}) {
     final headers = {
       'Content-Type': 'application/json',
-      'X-Request-ID': DateTime.now().millisecondsSinceEpoch.toString(),
+      'X-Request-ID': _newRequestId(),
+      'X-Run-ID': runId,
       'X-Action': action ?? 'unknown',
       'X-Mode': mode,
       'X-Encryption': encryption,
