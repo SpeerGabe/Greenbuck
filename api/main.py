@@ -312,6 +312,7 @@ async def timing_middleware(request: Request, call_next):
 
     # Pull research metadata from request headers
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    run_id = request.headers.get("X-Run-ID")  # links rows to markers.jsonl
     action_type = request.headers.get("X-Action", "unknown")
     platform = request.headers.get("X-Platform", "unknown")
     encryption_mode = request.headers.get("X-Encryption", "none")
@@ -332,8 +333,8 @@ async def timing_middleware(request: Request, call_next):
                 INSERT INTO timing_log (
                     request_id, action_type, platform, encryption_mode,
                     mitigation_state, receive_time, response_sent_time,
-                    duration_ms, cpu_utilization, endpoint, status_code
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    duration_ms, cpu_utilization, endpoint, status_code, run_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 """,
                 request_id,
                 action_type,
@@ -346,6 +347,7 @@ async def timing_middleware(request: Request, call_next):
                 cpu_avg,
                 request.url.path,
                 response.status_code,
+                run_id,
             )
     except Exception as e:
         logger.error(f"Timing log write failed: {e}")
