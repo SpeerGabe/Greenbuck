@@ -84,6 +84,8 @@ ALTER TABLE ONLY public.transactions
 CREATE TABLE public.timing_log (
     id integer NOT NULL,
     request_id character varying(36) NOT NULL,
+    run_id character varying(36),  -- capture run (X-Run-ID); joins to markers.jsonl
+    -- Existing database: ALTER TABLE public.timing_log ADD COLUMN run_id character varying(36);
     action_type character varying(50),
     platform character varying(20),
     encryption_mode character varying(20),
