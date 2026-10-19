@@ -52,7 +52,8 @@ void main() {
         await tester.enterText(find.byType(TextField).first, '50.00');
         await tester.tap(find.text('Add Transaction').last);
         await tester.pumpAndSettle(const Duration(seconds: 3));
-        expect(find.text('50.00'), findsWidgets);
+        // The list renders '-$50.00', so match on a substring, not exact text.
+        expect(find.textContaining('50.00'), findsWidgets);
         break;
 
       case 'check_balance':
