@@ -1,8 +1,11 @@
 /*
-Abstract class for client side traffic shaping mitigation schemes. Each mitigation scheme should implement this class and provide its own implementation of the following methods:
-- shapeBody: this method is responsible for shaping the body of the request according to the mitigation scheme's logic. (return plaintext if no shaping is needed)
-- beforeSend(): runs just before a call start for jitter mitigation scheme 
-- afterResponse(): runs just after a call ends for constant timing mitigation scheme
+Base class for client-side mitigation schemes. The defaults leave traffic untouched.
+- batchRequests: queue requests and send them together (batching)
+- padRequests: send every request at the same size on the wire (padding)
+- shapeBody: pads the plaintext JSON body before encryption (padding)
+- padWireBody: pads the final body, plaintext or encrypted envelope (padding)
+- headerPad: value for the X-Pad request header (padding)
+Jitter and constant-rate are applied by the server; their client schemes only carry the label.
 */
 
 abstract class MitigationScheme {
@@ -11,9 +14,11 @@ abstract class MitigationScheme {
   // true when requst should be queued and sent together for batching
   bool get batchRequests => false;
 
+  bool get padRequests => false;
+
   String shapeBody(String plaintextJson) => plaintextJson;
 
-  Future<void> beforeSend() async {}
+  String padWireBody(String body) => body;
 
-  Future<void> afterResponse(Duration elapsed) async {}
+  String headerPad({required String method, required String path, String? authorization}) => '';
 }
