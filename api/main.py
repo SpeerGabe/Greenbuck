@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 import json # For serializing the encryption envelope to JSON
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey # X25519 key exchange for shared secret derivation
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat # For serializing public keys to bytes for transmission
+from starlette.background import BackgroundTask # [CAPTURE FIX] runs the timing_log INSERT after the response is on the wire
 # ---- Logging Setup ----
 # Configure Python's logger so we can write info and error messages
 # that show up in the uvicorn console.
@@ -109,6 +110,39 @@ pool: Optional[asyncpg.Pool] = None
 # This holds the shared secret for each user session. In a real deployment, this would be stored in a secure session store or database, not in memory. For research purposes on an isolated network, we keep it simple.
 session_keys: dict[str, dict] = {}
 
+# ---- [CAPTURE FIX] Background CPU sampler (Global) ----
+# The old code called psutil.cpu_percent(interval=None) twice inside every
+# request and averaged the two. That value is meaningless: the "before" call
+# measures the idle gap since the PREVIOUS request, /proc/stat only has 10 ms
+# resolution so sub-millisecond windows come back as 0 / 50 / 100, and
+# concurrent requests (the dashboard's Future.wait) reset each other's window.
+# Instead, one background task samples system-wide CPU every 250 ms and each
+# timing_log row records the latest sample. cpu_utilization therefore means
+# "system CPU % over the ~250 ms before this request finished" — a usable
+# load covariate — and the /proc/stat reads are off the request path.
+CPU_SAMPLE_INTERVAL_S = 0.25
+latest_cpu_percent: Optional[float] = None
+
+
+async def _cpu_sampler():
+    global latest_cpu_percent
+    psutil.cpu_percent(interval=None)  # prime psutil; the first call always returns 0.0
+    while True:
+        await asyncio.sleep(CPU_SAMPLE_INTERVAL_S)
+        latest_cpu_percent = psutil.cpu_percent(interval=None)
+
+
+def research_header(request: Request, name: str, default: str) -> str:
+    """[CAPTURE FIX] Read an X-* research label header.
+
+    The client pads every label (X-Action, X-Encryption, X-Mitigation,
+    X-Platform, X-Mode) to a fixed 16 characters with trailing '.' so the
+    label's length can't show up in the encrypted request size. Strip that
+    padding here. Unpadded values pass through unchanged, so old clients and
+    curl still work.
+    """
+    return request.headers.get(name, default).rstrip(".")
+
 
 # ---- Lifespan: Startup and Shutdown Hooks ----
 # FastAPI calls this once when the server starts and once when it
@@ -130,7 +164,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to create database pool: {e}")
         raise # If the pool fails, the server should not start.
+    # [CAPTURE FIX] Start the CPU sampler and record the mitigation parameters
+    # in the server log, so every collection session shows which values it ran with.
+    sampler = asyncio.create_task(_cpu_sampler())
+    logger.info(
+        f"Mitigation params: padding={PADDING_TARGET_BYTES}B "
+        f"jitter={JITTER_MIN_MS}-{JITTER_MAX_MS}ms constant={CONSTANT_RATE_TARGET_MS}ms"
+    )
     yield # Server runs while paused here. After shutdown signal:
+    sampler.cancel()
     if pool:
         await pool.close()
         logger.info("Database connection pool closed")
@@ -175,12 +217,24 @@ async def _username_from_token(request: Request) -> Optional[str]:
 PADDING_TARGET_BYTES = 4096   # All padded responses become 4KB
 JITTER_MIN_MS = 0             # Lower bound for jitter delay
 JITTER_MAX_MS = 50            # Upper bound for jitter delay
-CONSTANT_RATE_TARGET_MS = 100 # Every response takes exactly this long
+# [CAPTURE FIX] The old 100 ms target is shorter than login (~105-160 ms) and
+# register (~295 ms) because both run Argon2id, so under "constant" those two
+# actions still stood out. The target has to exceed the slowest request ON THE
+# CAPTURE HOST, so it is now read from the environment (set it in run.sh after
+# measuring; see the query in run.sh.example). 400 ms is a placeholder default.
+CONSTANT_RATE_TARGET_MS = float(os.environ.get("CONSTANT_RATE_TARGET_MS", "400"))
+
+# [CAPTURE FIX] Labels the server knows how to apply. Anything else is rejected
+# with 400 instead of being silently treated as "none" while timing_log records
+# the bogus label — a typo would otherwise create mislabeled data that looks valid.
+VALID_MITIGATIONS = {"none", "padding", "jitter", "constant", "batching"}
 
 
 @app.middleware("http")
 async def mitigation_middleware(request: Request, call_next):
-    mitigation = request.headers.get("X-Mitigation", "none")
+    mitigation = research_header(request, "X-Mitigation", "none")
+    if mitigation not in VALID_MITIGATIONS:
+        return JSONResponse(status_code=400, content={"detail": f"Unknown mitigation: {mitigation}"})
 
     # Track wall-clock time for constant-rate mitigation.
     start = time.perf_counter()
@@ -204,6 +258,14 @@ async def mitigation_middleware(request: Request, call_next):
         remaining_ms = CONSTANT_RATE_TARGET_MS - elapsed_ms
         if remaining_ms > 0:
             await asyncio.sleep(remaining_ms / 1000)
+        else:
+            # [CAPTURE FIX] A request slower than the target leaks its real
+            # duration. Warn so an undersized target shows up during collection
+            # instead of only during analysis.
+            logger.warning(
+                f"constant-rate overrun: {request.url.path} took {elapsed_ms:.1f} ms "
+                f"> target {CONSTANT_RATE_TARGET_MS} ms"
+            )
         return response
 
     elif mitigation == "padding":
@@ -218,10 +280,23 @@ async def mitigation_middleware(request: Request, call_next):
         # If it's smaller than target, inject a padding field.
         # If already at or above target, leave it alone.
         if body.endswith(b"}") and len(body) < PADDING_TARGET_BYTES:
-            padding_needed = PADDING_TARGET_BYTES - len(body) - 14  # account for ', "_pad": ""'
+            # [CAPTURE FIX] The wrapper actually adds 10 net bytes: ,"_pad":" (9)
+            # plus "} (2) minus the one } removed. The old "- 14" assumed spaces
+            # that aren't in the string, so every response came out at 4092 B,
+            # not the 4096 B the paper states (requests, padded by the client,
+            # were already exactly 4096).
+            padding_needed = PADDING_TARGET_BYTES - len(body) - 10
             if padding_needed > 0:
                 pad_str = b"x" * padding_needed
                 body = body[:-1] + b',"_pad":"' + pad_str + b'"}'
+
+        if len(body) != PADDING_TARGET_BYTES:
+            # [CAPTURE FIX] Padding fails open: a body already at or over the
+            # target is sent at its real size. Warn so it's visible during
+            # collection (this is how a growing transaction history broke padding).
+            logger.warning(
+                f"padding miss: {request.url.path} body is {len(body)} B, target {PADDING_TARGET_BYTES} B"
+            )
 
         from fastapi import Response
         return Response(
@@ -243,19 +318,26 @@ async def mitigation_middleware(request: Request, call_next):
 # ============================================================
 @app.middleware("http")
 async def encryption_middleware(request: Request, call_next):
+    scheme_name = research_header(request, "X-Encryption", "none")
+
+    # [CAPTURE FIX] Reject unknown scheme names. Before, an unknown name fell
+    # through the first check and was sent as PLAINTEXT, while timing_log still
+    # recorded the bogus name as the encryption mode (verified: "AES-GCM" came
+    # back unencrypted but was logged as "AES-GCM"). The 400 that was meant to
+    # catch this sat after that check and could never run. The check now comes
+    # before the auth whitelist, so auth rows can't carry a bogus label either.
+    if scheme_name != "none" and scheme_name not in CIPHER_SCHEMES:
+        return JSONResponse(status_code=400, content={"detail": f"Unsupported encryption scheme: {scheme_name}"})
+
     # whitelist of path that are sent by plaintext
     if request.url.path in ("/auth/login", "/auth/register", "/auth/logout"):
         return await call_next(request)
-    
-    scheme_name = request.headers.get("X-Encryption", "none")
 
-    if scheme_name == "none" or scheme_name not in CIPHER_SCHEMES:
+    if scheme_name == "none":
         return await call_next(request)
 
-    scheme = CIPHER_SCHEMES.get(scheme_name)
-    if scheme_name not in CIPHER_SCHEMES:
-        return JSONResponse(status_code=400, content={"detail": f"Unsupported encryption scheme: {scheme_name}"})
-    
+    scheme = CIPHER_SCHEMES[scheme_name]
+
     username = await _username_from_token(request)
     if not username or username not in session_keys:
         return JSONResponse(status_code=401, content={"detail": "No encryption session established: please login again"})
@@ -308,52 +390,74 @@ async def encryption_middleware(request: Request, call_next):
 async def timing_middleware(request: Request, call_next):
     receive_time = datetime.now(timezone.utc) # Wall-clock time, UTC
     start = time.perf_counter() # Monotonic timer for accurate duration
-    cpu_before = psutil.cpu_percent(interval=None) # CPU snapshot
 
-    # Pull research metadata from request headers
+    # Pull research metadata from request headers.
+    # [CAPTURE FIX] research_header() strips the client's fixed-width padding.
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     run_id = request.headers.get("X-Run-ID")  # links rows to markers.jsonl
-    action_type = request.headers.get("X-Action", "unknown")
-    platform = request.headers.get("X-Platform", "unknown")
-    encryption_mode = request.headers.get("X-Encryption", "none")
-    mitigation_state = request.headers.get("X-Mitigation", "none")
+    action_type = research_header(request, "X-Action", "unknown")
+    platform = research_header(request, "X-Platform", "unknown")
+    encryption_mode = research_header(request, "X-Encryption", "none")
+    mitigation_state = research_header(request, "X-Mitigation", "none")
 
     # Process the request
     response = await call_next(request)
 
-    response_sent_time = datetime.now(timezone.utc)
+    # duration_ms = server processing time: request received -> response ready
+    # (includes decryption, the handler, mitigation delays and encryption).
     duration_ms = (time.perf_counter() - start) * 1000
-    cpu_after = psutil.cpu_percent(interval=None)
-    cpu_avg = (cpu_before + cpu_after) / 2
-    # Write to timing_log (don't let logging errors break the response)
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO timing_log (
-                    request_id, action_type, platform, encryption_mode,
-                    mitigation_state, receive_time, response_sent_time,
-                    duration_ms, cpu_utilization, endpoint, status_code, run_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                """,
-                request_id,
-                action_type,
-                platform,
-                encryption_mode,
-                mitigation_state,
-                receive_time,
-                response_sent_time,
-                duration_ms,
-                cpu_avg,
-                request.url.path,
-                response.status_code,
-                run_id,
-            )
-    except Exception as e:
-        logger.error(f"Timing log write failed: {e}")
+    status_code = response.status_code
+    endpoint = request.url.path
+    cpu_sample = latest_cpu_percent  # [CAPTURE FIX] latest background sample, see _cpu_sampler
+    # [CAPTURE FIX] For /batch, the endpoint stores which actions were inside the
+    # bundle (otherwise the row only says "batch"). None for all other endpoints.
+    batch_actions = getattr(request.state, "batch_actions", None)
+
+    async def write_timing_row():
+        # [CAPTURE FIX] This used to run BEFORE `return response`, so every
+        # response was held on the server until the Postgres INSERT committed.
+        # That added DB latency and variance to every packet timing the capture
+        # sees, but none of it showed up in duration_ms. Verified by locking
+        # timing_log: the client waited 1200 ms while duration_ms said 0.76 ms.
+        # Starlette runs a response's BackgroundTask only after the last body
+        # chunk has been sent, so the INSERT now happens after the response
+        # is on the wire.
+        #
+        # response_sent_time is taken here, i.e. when the full response has been
+        # handed to uvicorn for sending, which matches the column name. (It used
+        # to be "response ready", which is what duration_ms already measures.)
+        response_sent_time = datetime.now(timezone.utc)
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO timing_log (
+                        request_id, action_type, platform, encryption_mode,
+                        mitigation_state, receive_time, response_sent_time,
+                        duration_ms, cpu_utilization, endpoint, status_code, run_id,
+                        batch_actions
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    """,
+                    request_id,
+                    action_type,
+                    platform,
+                    encryption_mode,
+                    mitigation_state,
+                    receive_time,
+                    response_sent_time,
+                    duration_ms,
+                    cpu_sample,
+                    endpoint,
+                    status_code,
+                    run_id,
+                    batch_actions,
+                )
+        except Exception as e:
+            logger.error(f"Timing log write failed: {e}")
 
     # Echo request_id back in response for capture linkage
     response.headers["X-Request-ID"] = request_id
+    response.background = BackgroundTask(write_timing_row)  # [CAPTURE FIX] off the response path
     return response
 
 # ---- Data Models ----
@@ -560,7 +664,13 @@ BATCH_ACTIONS = {
 }
 
 @app.post("/batch")
-async def batch(req: BatchRequest, user: str = Depends(get_current_user)):
+async def batch(req: BatchRequest, request: Request, user: str = Depends(get_current_user)):
+    # [CAPTURE FIX] Record the bundle's contents for timing_log (read by
+    # timing_middleware via request.state). Without it, every batching-condition
+    # row says action_type="batch" and nothing tells you what was inside.
+    # Server-side only: nothing is added to the response.
+    request.state.batch_actions = ",".join(item.action for item in req.requests)
+
     if len(req.requests) > MAX_BATCH_SIZE:
         raise HTTPException(status_code=413, detail="Batch too large")
 
@@ -569,7 +679,9 @@ async def batch(req: BatchRequest, user: str = Depends(get_current_user)):
     for item in req.requests:
         handler = BATCH_ACTIONS.get(item.action)
         if handler is None:
-            responses.eppend({"id": item.id, "status": 400, "body": {"detail": f"Unknown action: {item.action}"}})
+            # [NON-CAPTURE FIX] was `responses.eppend(...)`: AttributeError -> the
+            # whole batch returned 500 instead of a per-item 400.
+            responses.append({"id": item.id, "status": 400, "body": {"detail": f"Unknown action: {item.action}"}})
             continue
         try:
             status, body = await handler(user, item.body)
