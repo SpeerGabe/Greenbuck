@@ -191,9 +191,9 @@ which is gitignored — raw capture data is not committed.
 
   Jitter and constant-rate run on the server only.
 - **Encryption:** multiple field-level cipher configurations (AES-GCM,
-  ChaCha20-Poly1305, AES-256-CBC), treated as a controlled variable. *(The
-  field-level encryption layer is in active development; the capture tool accepts
-  these options now.)*
+  ChaCha20-Poly1305, AES-256-CBC) on client and server, keyed per session by
+  an X25519 exchange at login, treated as a controlled variable. AES-256-CBC is
+  unauthenticated and serves as the weak baseline
 - **Analysis:** supervised classification (Random Forest, k-NN) on features
   extracted from captured traffic
 - **Primary result:** a privacy-utility tradeoff curve — each mitigation's
