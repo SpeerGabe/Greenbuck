@@ -35,7 +35,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 import json # For serializing the encryption envelope to JSON
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey # X25519 key exchange for shared secret derivation
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat # For serializing public keys to bytes for transmission
-from starlette.background import BackgroundTask # [CAPTURE FIX] runs the timing_log INSERT after the response is on the wire
+from starlette.background import BackgroundTask # Runs the timing_log INSERT after the response is sent
+from http import HTTPStatus # Reason phrases uvicorn puts in the response status line
 # ---- Logging Setup ----
 # Configure Python's logger so we can write info and error messages
 # that show up in the uvicorn console.
@@ -110,16 +111,10 @@ pool: Optional[asyncpg.Pool] = None
 # This holds the shared secret for each user session. In a real deployment, this would be stored in a secure session store or database, not in memory. For research purposes on an isolated network, we keep it simple.
 session_keys: dict[str, dict] = {}
 
-# ---- [CAPTURE FIX] Background CPU sampler (Global) ----
-# The old code called psutil.cpu_percent(interval=None) twice inside every
-# request and averaged the two. That value is meaningless: the "before" call
-# measures the idle gap since the PREVIOUS request, /proc/stat only has 10 ms
-# resolution so sub-millisecond windows come back as 0 / 50 / 100, and
-# concurrent requests (the dashboard's Future.wait) reset each other's window.
-# Instead, one background task samples system-wide CPU every 250 ms and each
-# timing_log row records the latest sample. cpu_utilization therefore means
-# "system CPU % over the ~250 ms before this request finished" — a usable
-# load covariate — and the /proc/stat reads are off the request path.
+# ---- Background CPU sampler (Global) ----
+# A background task samples system-wide CPU every 250 ms. Each timing_log row
+# records the latest sample: system CPU % over the ~250 ms before the request
+# finished.
 CPU_SAMPLE_INTERVAL_S = 0.25
 latest_cpu_percent: Optional[float] = None
 
@@ -133,13 +128,11 @@ async def _cpu_sampler():
 
 
 def research_header(request: Request, name: str, default: str) -> str:
-    """[CAPTURE FIX] Read an X-* research label header.
+    """Read an X-* research label header and strip the client's padding.
 
     The client pads every label (X-Action, X-Encryption, X-Mitigation,
-    X-Platform, X-Mode) to a fixed 16 characters with trailing '.' so the
-    label's length can't show up in the encrypted request size. Strip that
-    padding here. Unpadded values pass through unchanged, so old clients and
-    curl still work.
+    X-Platform, X-Mode) to 16 characters with trailing '.'. Unpadded values
+    pass through unchanged.
     """
     return request.headers.get(name, default).rstrip(".")
 
@@ -164,11 +157,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to create database pool: {e}")
         raise # If the pool fails, the server should not start.
-    # [CAPTURE FIX] Start the CPU sampler and record the mitigation parameters
-    # in the server log, so every collection session shows which values it ran with.
+    # Start the CPU sampler and log this session's mitigation parameters.
     sampler = asyncio.create_task(_cpu_sampler())
     logger.info(
-        f"Mitigation params: padding={PADDING_TARGET_BYTES}B "
+        f"Mitigation params: padding={PADDING_PLAINTEXT_BYTES}B plaintext / {PADDING_TARGET_BYTES}B wire "
         f"jitter={JITTER_MIN_MS}-{JITTER_MAX_MS}ms constant={CONSTANT_RATE_TARGET_MS}ms"
     )
     yield # Server runs while paused here. After shutdown signal:
@@ -205,29 +197,45 @@ async def _username_from_token(request: Request) -> Optional[str]:
 # ============================================================
 # Mitigation Middleware
 # Applies server-side traffic shaping based on the X-Mitigation
-# header. Three mitigations plus a no-op control:
+# header. Four mitigations plus a no-op control:
 #   - none: passthrough (control condition)
-#   - padding: pads response to a fixed size
+#   - padding: pads the plaintext response to PADDING_PLAINTEXT_BYTES
+#     (wire_padding_middleware then pads the final body on the wire)
 #   - jitter: random delay before response
 #   - constant: fixed total response time regardless of work
+#   - batching: handled by the /batch endpoint
 # ============================================================
 
 # Tunable mitigation parameters. These would be parameter-swept
 # in a follow-up study; for this paper they are held constant.
-PADDING_TARGET_BYTES = 4096   # All padded responses become 4KB
+PADDING_PLAINTEXT_BYTES = 2048  # Plaintext bodies, before encryption
+PADDING_TARGET_BYTES = 4096     # Final bodies on the wire (plaintext or encrypted envelope)
 JITTER_MIN_MS = 0             # Lower bound for jitter delay
 JITTER_MAX_MS = 50            # Upper bound for jitter delay
-# [CAPTURE FIX] The old 100 ms target is shorter than login (~105-160 ms) and
-# register (~295 ms) because both run Argon2id, so under "constant" those two
-# actions still stood out. The target has to exceed the slowest request ON THE
-# CAPTURE HOST, so it is now read from the environment (set it in run.sh after
-# measuring; see the query in run.sh.example). 400 ms is a placeholder default.
+# Constant-rate target, read from the environment (default 400 ms). Must be
+# above the slowest request on the capture host.
 CONSTANT_RATE_TARGET_MS = float(os.environ.get("CONSTANT_RATE_TARGET_MS", "400"))
 
-# [CAPTURE FIX] Labels the server knows how to apply. Anything else is rejected
-# with 400 instead of being silently treated as "none" while timing_log records
-# the bogus label — a typo would otherwise create mislabeled data that looks valid.
+# Mitigation labels the server accepts. Anything else gets a 400.
 VALID_MITIGATIONS = {"none", "padding", "jitter", "constant", "batching"}
+
+
+def _pad_json(body: bytes, target: int, key: bytes) -> bytes:
+    """Insert a filler key into a JSON object so the body is exactly `target` bytes.
+
+    Returns the body unchanged if it isn't a JSON object or is already too long.
+    Same algorithm as padJson() in lib/services/mitigations/padding_mitigation.dart.
+    """
+    if not body.endswith(b"}"):
+        return body
+    empty = body == b"{}"
+    prefix = b'{"' + key + b'":"' if empty else b',"' + key + b'":"'
+    suffix = b'"}'
+    kept = b"" if empty else body[:-1]
+    pad_len = target - len(kept) - len(prefix) - len(suffix)
+    if pad_len <= 0:
+        return body
+    return kept + prefix + b"x" * pad_len + suffix
 
 
 @app.middleware("http")
@@ -259,9 +267,7 @@ async def mitigation_middleware(request: Request, call_next):
         if remaining_ms > 0:
             await asyncio.sleep(remaining_ms / 1000)
         else:
-            # [CAPTURE FIX] A request slower than the target leaks its real
-            # duration. Warn so an undersized target shows up during collection
-            # instead of only during analysis.
+            # Request took longer than the target; log it.
             logger.warning(
                 f"constant-rate overrun: {request.url.path} took {elapsed_ms:.1f} ms "
                 f"> target {CONSTANT_RATE_TARGET_MS} ms"
@@ -269,36 +275,19 @@ async def mitigation_middleware(request: Request, call_next):
         return response
 
     elif mitigation == "padding":
-        # Pad the response body to a fixed size by reading the
-        # body and appending whitespace until it reaches target.
+        # Pad the plaintext response body (before encryption) with a "_pad" key.
         # Requires reading + reconstructing the response.
         body = b""
         async for chunk in response.body_iterator:
             body += chunk
 
-        # Only pad if the body is valid JSON ending in } or ].
-        # If it's smaller than target, inject a padding field.
-        # If already at or above target, leave it alone.
-        if body.endswith(b"}") and len(body) < PADDING_TARGET_BYTES:
-            # [CAPTURE FIX] The wrapper actually adds 10 net bytes: ,"_pad":" (9)
-            # plus "} (2) minus the one } removed. The old "- 14" assumed spaces
-            # that aren't in the string, so every response came out at 4092 B,
-            # not the 4096 B the paper states (requests, padded by the client,
-            # were already exactly 4096).
-            padding_needed = PADDING_TARGET_BYTES - len(body) - 10
-            if padding_needed > 0:
-                pad_str = b"x" * padding_needed
-                body = body[:-1] + b',"_pad":"' + pad_str + b'"}'
-
-        if len(body) != PADDING_TARGET_BYTES:
-            # [CAPTURE FIX] Padding fails open: a body already at or over the
-            # target is sent at its real size. Warn so it's visible during
-            # collection (this is how a growing transaction history broke padding).
+        body = _pad_json(body, PADDING_PLAINTEXT_BYTES, b"_pad")
+        if len(body) != PADDING_PLAINTEXT_BYTES:
+            # Body was already at or over the target and goes out at its real size; log it.
             logger.warning(
-                f"padding miss: {request.url.path} body is {len(body)} B, target {PADDING_TARGET_BYTES} B"
+                f"padding miss: {request.url.path} plaintext is {len(body)} B, target {PADDING_PLAINTEXT_BYTES} B"
             )
 
-        from fastapi import Response
         return Response(
             content=body,
             status_code=response.status_code,
@@ -315,17 +304,19 @@ async def mitigation_middleware(request: Request, call_next):
 # ============================================================
 # Encryption Middleware
 # Decrypts incoming request bodies if the X-Encryption header is set.
+# Every failure on an encrypted request (decryption, validation, handler
+# error) returns the same 400, so nothing decrypted is echoed back and
+# failures can't be told apart by status or body.
 # ============================================================
+def _encrypted_request_error() -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": "Request failed"})
+
+
 @app.middleware("http")
 async def encryption_middleware(request: Request, call_next):
     scheme_name = research_header(request, "X-Encryption", "none")
 
-    # [CAPTURE FIX] Reject unknown scheme names. Before, an unknown name fell
-    # through the first check and was sent as PLAINTEXT, while timing_log still
-    # recorded the bogus name as the encryption mode (verified: "AES-GCM" came
-    # back unencrypted but was logged as "AES-GCM"). The 400 that was meant to
-    # catch this sat after that check and could never run. The check now comes
-    # before the auth whitelist, so auth rows can't carry a bogus label either.
+    # Reject unknown scheme names (checked before the auth whitelist).
     if scheme_name != "none" and scheme_name not in CIPHER_SCHEMES:
         return JSONResponse(status_code=400, content={"detail": f"Unsupported encryption scheme: {scheme_name}"})
 
@@ -354,13 +345,16 @@ async def encryption_middleware(request: Request, call_next):
             await _set_body(request, plaintext)
         except Exception as e:
             logger.error(f"Decryption failed ({scheme_name}): {e}")
-            return JSONResponse(status_code=400, content={"detail": "Decryption failed"})
-        
+            return _encrypted_request_error()
+
     response = await call_next(request)
 
     if response.status_code >=400:
-        return response
-    
+        logger.warning(f"Encrypted request failed: {request.url.path} returned {response.status_code}")
+        async for _ in response.body_iterator:  # drain the discarded response
+            pass
+        return _encrypted_request_error()
+
     response_body = b""
     async for chunk in response.body_iterator:
         response_body += chunk
@@ -378,8 +372,71 @@ async def encryption_middleware(request: Request, call_next):
             )
         except Exception as e:
             logger.error(f"Response encryption failed ({scheme_name}): {e}")
-            return JSONResponse(status_code=500, content={"detail": "Response encryption error"})
+            return _encrypted_request_error()
     return response
+
+# ============================================================
+# Wire Padding Middleware
+# Under the padding mitigation, makes every response the same size on the
+# wire: pads the final body (plaintext, encrypted envelope or error) to
+# PADDING_TARGET_BYTES with a "_wpad" key, and adds an X-Pad header that
+# evens out the reason phrase in the status line ("OK" vs "Created").
+# Also logs a warning if requests within one run arrive at different sizes.
+# Sits outside the encryption middleware, so it sees the final body.
+# ============================================================
+PADDING_REASON_WIDTH = 32  # reason phrase + X-Pad value, in bytes
+
+# Request sizes seen under padding, per X-Run-ID.
+padded_request_sizes: dict[str, set[int]] = {}
+
+
+def _request_wire_size(request: Request) -> int:
+    """Size of the HTTP request as received: request line, header lines, body."""
+    scope = request.scope
+    target = len(scope.get("raw_path") or scope["path"].encode())
+    if scope.get("query_string"):
+        target += 1 + len(scope["query_string"])
+    request_line = len(scope["method"]) + 1 + target + 1 + len("HTTP/") + len(scope["http_version"]) + 2
+    header_lines = sum(len(name) + 2 + len(value) + 2 for name, value in scope["headers"]) + 2
+    return request_line + header_lines + int(request.headers.get("content-length") or 0)
+
+
+@app.middleware("http")
+async def wire_padding_middleware(request: Request, call_next):
+    if research_header(request, "X-Mitigation", "none") != "padding":
+        return await call_next(request)
+
+    run_id = request.headers.get("X-Run-ID", "none")
+    size = _request_wire_size(request)
+    sizes = padded_request_sizes.setdefault(run_id, set())
+    if size not in sizes:
+        sizes.add(size)
+        if len(sizes) > 1:
+            logger.warning(
+                f"padding: request sizes differ in run {run_id}: {sorted(sizes)} B "
+                f"({request.method} {request.url.path} is {size} B)"
+            )
+
+    response = await call_next(request)
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+    body = _pad_json(body, PADDING_TARGET_BYTES, b"_wpad")
+    if len(body) != PADDING_TARGET_BYTES:
+        logger.warning(
+            f"padding miss: {request.url.path} wire body is {len(body)} B, target {PADDING_TARGET_BYTES} B"
+        )
+
+    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    phrase = HTTPStatus(response.status_code).phrase
+    headers["X-Pad"] = "x" * max(1, PADDING_REASON_WIDTH - len(phrase))
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        media_type=response.media_type,
+    )
 
 # ============================================================
 # Timing Log Middleware
@@ -392,7 +449,7 @@ async def timing_middleware(request: Request, call_next):
     start = time.perf_counter() # Monotonic timer for accurate duration
 
     # Pull research metadata from request headers.
-    # [CAPTURE FIX] research_header() strips the client's fixed-width padding.
+    # research_header() strips the client's fixed-width padding.
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     run_id = request.headers.get("X-Run-ID")  # links rows to markers.jsonl
     action_type = research_header(request, "X-Action", "unknown")
@@ -408,24 +465,14 @@ async def timing_middleware(request: Request, call_next):
     duration_ms = (time.perf_counter() - start) * 1000
     status_code = response.status_code
     endpoint = request.url.path
-    cpu_sample = latest_cpu_percent  # [CAPTURE FIX] latest background sample, see _cpu_sampler
-    # [CAPTURE FIX] For /batch, the endpoint stores which actions were inside the
-    # bundle (otherwise the row only says "batch"). None for all other endpoints.
+    cpu_sample = latest_cpu_percent  # latest background sample, see _cpu_sampler
+    # For /batch: the actions inside the bundle (set by the endpoint). None otherwise.
     batch_actions = getattr(request.state, "batch_actions", None)
 
     async def write_timing_row():
-        # [CAPTURE FIX] This used to run BEFORE `return response`, so every
-        # response was held on the server until the Postgres INSERT committed.
-        # That added DB latency and variance to every packet timing the capture
-        # sees, but none of it showed up in duration_ms. Verified by locking
-        # timing_log: the client waited 1200 ms while duration_ms said 0.76 ms.
-        # Starlette runs a response's BackgroundTask only after the last body
-        # chunk has been sent, so the INSERT now happens after the response
-        # is on the wire.
-        #
-        # response_sent_time is taken here, i.e. when the full response has been
-        # handed to uvicorn for sending, which matches the column name. (It used
-        # to be "response ready", which is what duration_ms already measures.)
+        # Runs as a BackgroundTask, after the last body chunk has been sent.
+        # response_sent_time is taken here: when the full response has been
+        # handed to uvicorn for sending.
         response_sent_time = datetime.now(timezone.utc)
         try:
             async with pool.acquire() as conn:
@@ -457,7 +504,7 @@ async def timing_middleware(request: Request, call_next):
 
     # Echo request_id back in response for capture linkage
     response.headers["X-Request-ID"] = request_id
-    response.background = BackgroundTask(write_timing_row)  # [CAPTURE FIX] off the response path
+    response.background = BackgroundTask(write_timing_row)  # INSERT runs after the response is sent
     return response
 
 # ---- Data Models ----
@@ -576,7 +623,8 @@ async def create_transaction(transaction: Transaction, user: str = Depends(get_c
 @app.post("/auth/register", status_code=201)
 async def register(req: RegisterRequest):
     try:
-        hashed = hash_password(req.password)
+        # Hash in a worker thread so Argon2id doesn't block the event loop.
+        hashed = await asyncio.to_thread(hash_password, req.password)
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
@@ -601,10 +649,11 @@ async def login(req: LoginRequest):
                 req.username,
             )
 
+        # Verify in a worker thread so Argon2id doesn't block the event loop.
         if row is not None:
-            password_valid = verify_password(req.password, row["password_hash"])
+            password_valid = await asyncio.to_thread(verify_password, req.password, row["password_hash"])
         else:
-            verify_password(req.password, DUMMY_PASSWORD_HASH)
+            await asyncio.to_thread(verify_password, req.password, DUMMY_PASSWORD_HASH)
             password_valid = False
 
         if row is None or not password_valid:
@@ -665,10 +714,8 @@ BATCH_ACTIONS = {
 
 @app.post("/batch")
 async def batch(req: BatchRequest, request: Request, user: str = Depends(get_current_user)):
-    # [CAPTURE FIX] Record the bundle's contents for timing_log (read by
-    # timing_middleware via request.state). Without it, every batching-condition
-    # row says action_type="batch" and nothing tells you what was inside.
-    # Server-side only: nothing is added to the response.
+    # Record the bundle's actions for timing_log (read by timing_middleware via
+    # request.state). Not added to the response.
     request.state.batch_actions = ",".join(item.action for item in req.requests)
 
     if len(req.requests) > MAX_BATCH_SIZE:
@@ -679,8 +726,6 @@ async def batch(req: BatchRequest, request: Request, user: str = Depends(get_cur
     for item in req.requests:
         handler = BATCH_ACTIONS.get(item.action)
         if handler is None:
-            # [NON-CAPTURE FIX] was `responses.eppend(...)`: AttributeError -> the
-            # whole batch returned 500 instead of a per-item 400.
             responses.append({"id": item.id, "status": 400, "body": {"detail": f"Unknown action: {item.action}"}})
             continue
         try:
