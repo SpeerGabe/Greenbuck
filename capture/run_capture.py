@@ -1,16 +1,21 @@
 """
 GreenBuck Capture Orchestrator
 Runs on the Windows dev machine. Coordinates a single research capture:
+  0. Resets the server database to a fixed seed (reset_state.sql)   [CAPTURE FIX]
   1. Starts tcpdump on the Pi via SSH
   2. Triggers the Flutter integration test for the requested action
   3. Stops tcpdump (always, even if step 2 fails)
   4. Pulls the resulting pcap file back to Windows
   5. Writes a markers entry linking the run to its capture window
+     (now also packet_count and seed_sha)                           [CAPTURE FIX]
 """
 
 import argparse
+import hashlib  # [CAPTURE FIX] fingerprint of the seed file, written to markers
 import shutil
+import struct   # [CAPTURE FIX] reads pcap record headers to count packets
 import subprocess
+import sys
 import time
 import uuid
 import json
@@ -31,6 +36,73 @@ BASE_URL = os.environ.get("BASE_URL", f"https://{PI_HOST}:8000")
 PI_CAPTURE_DIR = "/tmp/greenbuck_captures"
 LOCAL_CAPTURE_DIR = Path(__file__).parent / "data"
 MARKERS_LOG = LOCAL_CAPTURE_DIR / "markers.jsonl"
+
+# [CAPTURE FIX] Per-run DB reset. The SQL is read locally and piped to this
+# command on the server over SSH. The default uses the postgres superuser over
+# the local socket (peer auth); -n makes sudo fail at once instead of hanging
+# on a password prompt (the same passwordless sudo tcpdump already needs).
+# Override DB_RESET_CMD in .env if the server is set up differently.
+RESET_SQL_PATH = Path(__file__).parent / "reset_state.sql"
+DB_RESET_CMD = os.environ.get(
+    "DB_RESET_CMD",
+    "sudo -n -u postgres psql -d greenbuck -v ON_ERROR_STOP=1 -q -f -",
+)
+
+# [CAPTURE FIX] The whole study assumes the observer only sees TLS. The README's
+# local-dev setup runs plain HTTP, so refuse to capture against http:// —
+# otherwise the payloads would be in the clear in the pcap.
+if not BASE_URL.startswith("https://"):
+    sys.exit(f"[!] BASE_URL must be https:// for captures (got {BASE_URL})")
+
+
+def reset_server_state(ssh):
+    """[CAPTURE FIX] Put the database back to the fixed seed before each run.
+
+    Returns a short sha256 of the seed file, written to markers.jsonl so runs
+    collected with different seeds can be told apart. Raises if the reset fails,
+    so a run never starts from an unknown database state.
+    """
+    sql = RESET_SQL_PATH.read_text(encoding="utf-8")
+    stdin, stdout, stderr = ssh.exec_command(DB_RESET_CMD)
+    stdin.write(sql)
+    stdin.channel.shutdown_write()  # EOF so psql runs the script and exits
+    exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"DB reset failed (exit {exit_code}): {stderr.read().decode().strip()}"
+        )
+    return hashlib.sha256(sql.encode("utf-8")).hexdigest()[:12]
+
+
+def count_pcap_packets(path):
+    """[CAPTURE FIX] Count packet records in a classic libpcap file (tcpdump -w).
+
+    A capture with zero packets means tcpdump was listening on the wrong
+    interface. That's easy to hit now that the server is Jose's laptop: the
+    phone's traffic arrives over WiFi, but .env.example still says
+    PI_INTERFACE=eth0. Without this check such runs look normal, since the test
+    passes and an empty but valid pcap is written.
+    """
+    with open(path, "rb") as f:
+        header = f.read(24)  # global header
+        if len(header) < 24:
+            return 0
+        magic = header[:4]
+        if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):    # little-endian (us / ns)
+            endian = "<"
+        elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):  # big-endian (us / ns)
+            endian = ">"
+        else:
+            raise ValueError(f"{path} is not a libpcap file")
+        count = 0
+        while True:
+            record = f.read(16)  # per-packet header: ts_sec, ts_frac, incl_len, orig_len
+            if len(record) < 16:
+                break
+            incl_len = struct.unpack(endian + "IIII", record)[2]
+            f.seek(incl_len, 1)  # skip the packet bytes
+            count += 1
+    return count
 
 
 def ssh_connect():
@@ -107,7 +179,8 @@ def pull_pcap(ssh, remote_path, local_filename):
 
 
 def write_marker(run_id, action, platform, encryption, mitigation,
-                 run_number, start_time, end_time, pcap_filename, test_passed):
+                 run_number, start_time, end_time, pcap_filename, test_passed,
+                 packet_count, seed_sha):
     """Append a marker entry linking the run to the pcap file."""
     LOCAL_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -121,6 +194,8 @@ def write_marker(run_id, action, platform, encryption, mitigation,
         "end_time": end_time.isoformat(),
         "pcap_filename": pcap_filename,
         "test_passed": test_passed,
+        "packet_count": packet_count,  # [CAPTURE FIX] 0 = wrong interface / nothing captured
+        "seed_sha": seed_sha,          # [CAPTURE FIX] which reset_state.sql this run started from
     }
     with open(MARKERS_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -152,6 +227,12 @@ def main():
 
     ssh = ssh_connect()
     try:
+        # [CAPTURE FIX] Reset before tcpdump starts, so every run begins from the
+        # same database state. The reset traffic (SSH on 22, psql on a local
+        # socket) wouldn't match the port 8000 filter anyway.
+        seed_sha = reset_server_state(ssh)
+        print(f"[*] DB reset to seed {seed_sha}")
+
         start_time = datetime.now(timezone.utc)
         pid, remote_path = start_tcpdump(ssh, pcap_filename)
         print(f"[*] tcpdump started (pid {pid})")
@@ -173,12 +254,16 @@ def main():
             print("[*] tcpdump stopped")
 
         local_path = pull_pcap(ssh, remote_path, pcap_filename)
-        print(f"[*] pcap saved: {local_path}")
+        packet_count = count_pcap_packets(local_path)  # [CAPTURE FIX]
+        print(f"[*] pcap saved: {local_path} ({packet_count} packets)")
+        if packet_count == 0:
+            print("[!] WARNING: pcap is empty. Check PI_INTERFACE (WiFi is usually wlan0/wlp*, not eth0).")
 
         write_marker(
             run_id, args.action, args.platform,
             args.encryption, args.mitigation, args.run,
             start_time, end_time, pcap_filename, success,
+            packet_count, seed_sha,
         )
         print("[*] marker written")
     finally:
