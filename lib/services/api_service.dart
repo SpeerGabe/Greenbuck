@@ -21,7 +21,7 @@ class ApiService {
   'BASE_URL',
   defaultValue: 'https://192.168.1.100:8000',
   );
-  
+
   // Singleton instance of the EncryptionService for handling encryption and decryption.
   final EncryptionService encryptionService = EncryptionService();
 
@@ -83,15 +83,9 @@ class ApiService {
     return sb.toString();
   }
 
-  // [CAPTURE FIX] Every research label header is padded to this fixed width.
-  // The labels travel inside the TLS traffic being measured, so their length
-  // shows up in the encrypted request size. X-Action was 5 bytes for "login"
-  // but 13 for "check_balance": each request carried a size difference that
-  // came from the label itself, not the app's behaviour, which a classifier
-  // could pick up. X-Encryption / X-Mitigation also differed in length between
-  // configurations, which skews size-overhead comparisons. Same idea as the
-  // fixed-length X-Request-ID above. The server strips the '.' padding
-  // (research_header() in api/main.py).
+  // Research label headers are padded to this fixed width with '.' so a
+  // label's length doesn't change the encrypted request size. The server
+  // strips the padding (research_header() in api/main.py).
   static const int _labelWidth = 16;
 
   static String _label(String value) {
@@ -104,14 +98,16 @@ class ApiService {
   // X-Request-ID is generated per request for capture linkage.
   Map<String, String> _headers({String? action}) {
     final headers = {
-      'Content-Type': 'application/json',
+      // charset set explicitly: package:http appends it to requests with a
+      // body, so this keeps the header identical on every request.
+      'Content-Type': 'application/json; charset=utf-8',
       'X-Request-ID': _newRequestId(),
       'X-Run-ID': runId,
-      'X-Action': _label(action ?? 'unknown'),   // [CAPTURE FIX] fixed width
-      'X-Mode': _label(mode),                    // [CAPTURE FIX] fixed width
-      'X-Encryption': _label(encryption),        // [CAPTURE FIX] fixed width
-      'X-Mitigation': _label(mitigation),        // [CAPTURE FIX] fixed width
-      'X-Platform': _label(platform),            // [CAPTURE FIX] fixed width
+      'X-Action': _label(action ?? 'unknown'),
+      'X-Mode': _label(mode),
+      'X-Encryption': _label(encryption),
+      'X-Mitigation': _label(mitigation),
+      'X-Platform': _label(platform),
     };
     // Attach the JWT on every request once logged in. Protected routes
     // (transactions, balance) require it; open routes ignore it.
@@ -141,19 +137,51 @@ class ApiService {
     return encryptedBody;
   }
 
-  //runs requests between the active mitigations's before and after methods
-  Future<T> _mitigated<T>(Future<T> Function() call) async {
+  // Sends one request to [path].
+  // [data] is the JSON body (null = no body). [encryptedRoute] marks routes
+  // whose bodies use field-level encryption (everything except /auth/*).
+  // Under padding, every request carries a body (GETs send an empty object),
+  // the final body is padded to the same size, and an X-Pad header evens out
+  // the request line and Authorization header, so all requests are the same
+  // size on the wire.
+  Future<http.Response> _send(
+    String method,
+    String path,
+    String action, {
+    Map<String, dynamic>? data,
+    bool encryptedRoute = false,
+  }) async {
     final scheme = mitigationService.activeScheme;
-    final stopwatch = Stopwatch()..start();
+    final headers = _headers(action: action);
 
-    await scheme.beforeSend();
-    try {
-      final result = await call();
-      return result;
-    } finally {
-      // ensure failed calls get the same timing as successful calls
-      await scheme.afterResponse(stopwatch.elapsed);
+    if (scheme.padRequests) {
+      data ??= {};
     }
+
+    String? body;
+    if (data != null) {
+      body = encryptedRoute ? await _prepareRequestBody(data) : _plainBody(data);
+    }
+
+    if (scheme.padRequests) {
+      body = scheme.padWireBody(body!);
+      headers['X-Pad'] = scheme.headerPad(
+        method: method,
+        path: path,
+        authorization: headers['Authorization'],
+      );
+    }
+
+    final request = http.Request(method, Uri.parse('$baseUrl$path'))
+      ..headers.addAll(headers);
+    if (body != null) {
+      request.body = body;
+    }
+
+    return _client
+        .send(request)
+        .then(http.Response.fromStream)
+        .timeout(const Duration(seconds: 5));
   }
 
   Future<Map<String, dynamic>> _parseResponseBody(String responseBody) async {
@@ -170,7 +198,7 @@ class ApiService {
 
 
   // Fetch all transactions from the backend.
-  Future<List<Transaction>> _getTransactions() async {
+  Future<List<Transaction>> getTransactions() async {
 
     if(_batching) {
       final body = await _batcher.enqueue('view_history');
@@ -178,12 +206,7 @@ class ApiService {
       return data.map((json) => Transaction.fromJson(json)).toList();
     }
 
-    final response = await _client
-        .get(
-          Uri.parse('$baseUrl/transactions'),
-          headers: _headers(action: 'view_history'),
-        )
-        .timeout(const Duration(seconds: 5));
+    final response = await _send('GET', '/transactions', 'view_history', encryptedRoute: true);
 
     if (response.statusCode == 200) {
       final body = await _parseResponseBody(response.body);
@@ -193,27 +216,18 @@ class ApiService {
       throw Exception('Failed to load transactions: ${response.statusCode}');
     }
   }
-  // wraps the _getTransactions method with mitigation logic, so that mitigation is applied
-  Future<List<Transaction>> getTransactions() {
-    final result = _mitigated(() => _getTransactions());
-    return result;
-  }
 
   // Create a new transaction. Returns the created record with its real ID.
-  Future<Transaction> _createTransaction(Transaction transaction) async {
+  Future<Transaction> createTransaction(Transaction transaction) async {
     if(_batching){
       final body = await _batcher.enqueue('make_transfer', transaction.toJson());
       return Transaction.fromJson(body);
     }
-    final requestBody = await _prepareRequestBody(transaction.toJson());
-    final response = await _client
 
-        .post(
-          Uri.parse('$baseUrl/transactions'),
-          headers: _headers(action: 'make_transfer'),
-          body: requestBody,
-        )
-        .timeout(const Duration(seconds: 5));
+    final response = await _send(
+      'POST', '/transactions', 'make_transfer',
+      data: transaction.toJson(), encryptedRoute: true,
+    );
 
     if (response.statusCode == 201) {
       final body = await _parseResponseBody(response.body);
@@ -222,27 +236,16 @@ class ApiService {
       throw Exception('Failed to create transaction: ${response.statusCode}');
     }
   }
-  // wraps the _createTransaction methed with mitigation logic, so that mitigation is applied 
-  Future<Transaction> createTransaction(Transaction transaction) {
-    final result = _mitigated(() => _createTransaction(transaction));
-    return result;
-  }
 
   // Login — produces a distinct POST pattern as a research action.
-  Future<Map<String, dynamic>> _login(String username, String password) async {
+  Future<Map<String, dynamic>> login(String username, String password) async {
     final clientPubKey = await encryptionService.generateClientPublicKey();
 
-    final response = await _client
-        .post(
-          Uri.parse('$baseUrl/auth/login'),
-          headers: _headers(action: 'login'),
-          body: jsonEncode({
-            'username': username, 
-            'password': password,
-            'client_public_key': clientPubKey,
-            }),
-        )
-        .timeout(const Duration(seconds: 5));
+    final response = await _send('POST', '/auth/login', 'login', data: {
+      'username': username,
+      'password': password,
+      'client_public_key': clientPubKey,
+    });
 
     if (response.statusCode == 200) {
       //parse the body for encryption
@@ -257,64 +260,34 @@ class ApiService {
       throw Exception('Login failed: ${response.statusCode}');
     }
   }
-  // wraps the _login method with mitigation logic, so that mitigation is applied
-  Future<Map<String, dynamic>> login(String username, String password) {
-    final result = _mitigated(() => _login(username, password));
-    return result;
-  }
+
   // Register a new user — captured research action (6th class).
-  Future<void> _register(String username, String password) async {
-    final response = await _client
-        .post(
-          Uri.parse('$baseUrl/auth/register'),
-          headers: _headers(action: 'register'),
-          body: jsonEncode({'username': username, 'password': password}),
-        )
-        .timeout(const Duration(seconds: 5));
+  Future<void> register(String username, String password) async {
+    final response = await _send('POST', '/auth/register', 'register',
+        data: {'username': username, 'password': password});
 
     if (response.statusCode != 201) {
       throw Exception('Registration failed: ${response.statusCode}');
     }
   }
-  // wraps the _register method with mitigation logic, so that mitigation is applied
-  Future<void> register(String username, String password) {
-    final result = _mitigated(() => _register(username, password));
-    return result;
-  }
 
   // Logout — small response, distinct from other actions.
-  Future<void> _logout(String token) async {
-    final response = await _client
-        .post(
-          Uri.parse('$baseUrl/auth/logout'),
-          headers: _headers(action: 'logout'),
-          body: jsonEncode({'token': token}),
-        )
-        .timeout(const Duration(seconds: 5));
+  Future<void> logout(String token) async {
+    final response = await _send('POST', '/auth/logout', 'logout', data: {'token': token});
 
     if (response.statusCode != 200) {
       throw Exception('Logout failed: ${response.statusCode}');
     }
   }
-  // wraps the _logout method with mitigation logic, so that mitigation is applied
-  Future<void> logout(String token) {
-    final result = _mitigated(() => _logout(token));
-    return result;
-  }
 
   // Balance summary — smaller response than full transactions list.
-  Future<double> _getBalance() async {
+  Future<double> getBalance() async {
     if(_batching){
       final body = await _batcher.enqueue('check_balance');
       return (body['balance'] as num).toDouble();
     }
 
-    final response = await _client
-        .get(
-          Uri.parse('$baseUrl/balance'),
-          headers: _headers(action: 'check_balance'),
-        )
-        .timeout(const Duration(seconds: 5));
+    final response = await _send('GET', '/balance', 'check_balance', encryptedRoute: true);
 
     if (response.statusCode == 200) {
       final body = await _parseResponseBody(response.body);
@@ -323,23 +296,11 @@ class ApiService {
       throw Exception('Balance check failed: ${response.statusCode}');
     }
   }
-  // wraps the _getBalance method with mitigation logic, so that mitigation is applied
-  Future<double> getBalance() {
-    final result = _mitigated(() => _getBalance());
-    return result;
-  }
 
   // sends out a batch as a single POST and returns the per request results
   Future<List<dynamic>> _sendBatch(List<Map<String, dynamic>> items) async {
-    final requestBody = await _prepareRequestBody({'requests': items});
-
-    final response = await _client
-      .post(
-        Uri.parse('$baseUrl/batch'),
-        headers: _headers(action: 'batch'),
-        body: requestBody,
-      )
-      .timeout(const Duration(seconds: 5));
+    final response = await _send('POST', '/batch', 'batch',
+        data: {'requests': items}, encryptedRoute: true);
 
     if (response.statusCode != 200) {
       throw Exception('Batch failed: ${response.statusCode}');
