@@ -1,19 +1,19 @@
 """
 GreenBuck Capture Orchestrator
 Runs on the Windows dev machine. Coordinates a single research capture:
-  0. Resets the server database to a fixed seed (reset_state.sql)   [CAPTURE FIX]
+  0. Resets the server database to a fixed seed (reset_state.sql)
   1. Starts tcpdump on the Pi via SSH
   2. Triggers the Flutter integration test for the requested action
   3. Stops tcpdump (always, even if step 2 fails)
   4. Pulls the resulting pcap file back to Windows
-  5. Writes a markers entry linking the run to its capture window
-     (now also packet_count and seed_sha)                           [CAPTURE FIX]
+  5. Writes a markers entry linking the run to its capture window,
+     with packet_count and seed_sha
 """
 
 import argparse
-import hashlib  # [CAPTURE FIX] fingerprint of the seed file, written to markers
+import hashlib  # fingerprint of the seed file, written to markers
 import shutil
-import struct   # [CAPTURE FIX] reads pcap record headers to count packets
+import struct   # reads pcap record headers to count packets
 import subprocess
 import sys
 import time
@@ -37,30 +37,26 @@ PI_CAPTURE_DIR = "/tmp/greenbuck_captures"
 LOCAL_CAPTURE_DIR = Path(__file__).parent / "data"
 MARKERS_LOG = LOCAL_CAPTURE_DIR / "markers.jsonl"
 
-# [CAPTURE FIX] Per-run DB reset. The SQL is read locally and piped to this
-# command on the server over SSH. The default uses the postgres superuser over
-# the local socket (peer auth); -n makes sudo fail at once instead of hanging
-# on a password prompt (the same passwordless sudo tcpdump already needs).
-# Override DB_RESET_CMD in .env if the server is set up differently.
+# Per-run DB reset: reset_state.sql is read locally and piped over SSH into
+# this command on the server. Default: the postgres superuser over the local
+# socket; -n makes sudo fail instead of prompting for a password.
+# Override with DB_RESET_CMD in .env.
 RESET_SQL_PATH = Path(__file__).parent / "reset_state.sql"
 DB_RESET_CMD = os.environ.get(
     "DB_RESET_CMD",
     "sudo -n -u postgres psql -d greenbuck -v ON_ERROR_STOP=1 -q -f -",
 )
 
-# [CAPTURE FIX] The whole study assumes the observer only sees TLS. The README's
-# local-dev setup runs plain HTTP, so refuse to capture against http:// —
-# otherwise the payloads would be in the clear in the pcap.
+# Captures must go over TLS: refuse an http:// backend.
 if not BASE_URL.startswith("https://"):
     sys.exit(f"[!] BASE_URL must be https:// for captures (got {BASE_URL})")
 
 
 def reset_server_state(ssh):
-    """[CAPTURE FIX] Put the database back to the fixed seed before each run.
+    """Reset the server database to the fixed seed in reset_state.sql.
 
-    Returns a short sha256 of the seed file, written to markers.jsonl so runs
-    collected with different seeds can be told apart. Raises if the reset fails,
-    so a run never starts from an unknown database state.
+    Returns a short sha256 of the seed file (written to markers.jsonl).
+    Raises if the reset fails.
     """
     sql = RESET_SQL_PATH.read_text(encoding="utf-8")
     stdin, stdout, stderr = ssh.exec_command(DB_RESET_CMD)
@@ -75,14 +71,7 @@ def reset_server_state(ssh):
 
 
 def count_pcap_packets(path):
-    """[CAPTURE FIX] Count packet records in a classic libpcap file (tcpdump -w).
-
-    A capture with zero packets means tcpdump was listening on the wrong
-    interface. That's easy to hit now that the server is Jose's laptop: the
-    phone's traffic arrives over WiFi, but .env.example still says
-    PI_INTERFACE=eth0. Without this check such runs look normal, since the test
-    passes and an empty but valid pcap is written.
-    """
+    """Count packet records in a classic libpcap file (tcpdump -w)."""
     with open(path, "rb") as f:
         header = f.read(24)  # global header
         if len(header) < 24:
@@ -126,8 +115,10 @@ def start_tcpdump(ssh, filename):
     ssh_run(ssh, f"mkdir -p {PI_CAPTURE_DIR}")  # wait for it, so tcpdump never races it
     # Start tcpdump unbuffered in the background. We fetch the real
     # tcpdump pid separately with pgrep (not sudo's or the subshell's).
+    # --immediate-mode delivers each packet as it arrives, so nothing is left
+    # buffered when tcpdump is stopped.
     cmd = (
-        f"sudo tcpdump -i {PI_INTERFACE} -U -w {remote_path} "
+        f"sudo tcpdump -i {PI_INTERFACE} --immediate-mode -U -w {remote_path} "
         f"port 8000 > /dev/null 2>&1 &"
     )
     ssh.exec_command(cmd)
@@ -194,8 +185,8 @@ def write_marker(run_id, action, platform, encryption, mitigation,
         "end_time": end_time.isoformat(),
         "pcap_filename": pcap_filename,
         "test_passed": test_passed,
-        "packet_count": packet_count,  # [CAPTURE FIX] 0 = wrong interface / nothing captured
-        "seed_sha": seed_sha,          # [CAPTURE FIX] which reset_state.sql this run started from
+        "packet_count": packet_count,  # 0 = nothing captured
+        "seed_sha": seed_sha,          # which reset_state.sql the run started from
     }
     with open(MARKERS_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -221,15 +212,17 @@ def main():
         f"{args.mitigation}_{args.run:03d}.pcap"
     )
 
+    # Don't overwrite an existing capture.
+    if (LOCAL_CAPTURE_DIR / pcap_filename).exists():
+        sys.exit(f"[!] {pcap_filename} already exists in {LOCAL_CAPTURE_DIR}; use a new --run number")
+
     print(f"[*] Run {args.run}: {pcap_filename}")
     print(f"[*] Run ID: {run_id}")
     print(f"[*] Backend: {BASE_URL}")
 
     ssh = ssh_connect()
     try:
-        # [CAPTURE FIX] Reset before tcpdump starts, so every run begins from the
-        # same database state. The reset traffic (SSH on 22, psql on a local
-        # socket) wouldn't match the port 8000 filter anyway.
+        # Reset before tcpdump starts so every run begins from the same database state.
         seed_sha = reset_server_state(ssh)
         print(f"[*] DB reset to seed {seed_sha}")
 
@@ -254,7 +247,7 @@ def main():
             print("[*] tcpdump stopped")
 
         local_path = pull_pcap(ssh, remote_path, pcap_filename)
-        packet_count = count_pcap_packets(local_path)  # [CAPTURE FIX]
+        packet_count = count_pcap_packets(local_path)
         print(f"[*] pcap saved: {local_path} ({packet_count} packets)")
         if packet_count == 0:
             print("[!] WARNING: pcap is empty. Check PI_INTERFACE (WiFi is usually wlan0/wlp*, not eth0).")
