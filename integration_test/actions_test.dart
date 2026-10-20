@@ -39,7 +39,7 @@ void main() {
         await tester.pumpAndSettle(const Duration(seconds: 4));
         await tester.tap(find.text('Transactions'));
         await tester.pumpAndSettle(const Duration(seconds: 3));
-        expect(find.text('Failed to load'), findsNothing);
+        expect(find.text('Could not load transactions'), findsNothing);
         break;
 
       case 'make_transfer':
@@ -52,7 +52,7 @@ void main() {
         await tester.enterText(find.byType(TextField).first, '50.00');
         await tester.tap(find.text('Add Transaction').last);
         await tester.pumpAndSettle(const Duration(seconds: 3));
-        // The list renders '-$50.00', so match on a substring, not exact text.
+        expect(find.text('Failed to add transaction'), findsNothing);
         expect(find.textContaining('50.00'), findsWidgets);
         break;
 
@@ -61,12 +61,12 @@ void main() {
         await tester.pumpAndSettle(const Duration(seconds: 4));
         await tester.tap(find.byIcon(Icons.refresh).first);
         await tester.pumpAndSettle(const Duration(seconds: 3));
+        expect(find.text('Could not load dashboard'), findsNothing);
+        expect(find.text('Total Spent'), findsOneWidget);
         break;
 
       
       case 'register':
-        // Unique username per run so every capture is a successful 201,
-        // not a 409 "already exists" (which would be different traffic).
         final uniqueUser = 'user_${DateTime.now().millisecondsSinceEpoch}';
         await api.register(uniqueUser, 'testpass');
         await tester.pumpAndSettle(const Duration(seconds: 2));
@@ -86,7 +86,7 @@ void main() {
           const Offset(0, -100),
         );
         await tester.tap(find.text('Log Out'));
-        await tester.pumpAndSettle(const Duration(seconds: 3));
+        expect(find.text('Login'), findsOneWidget);
         break;
 
       default:
