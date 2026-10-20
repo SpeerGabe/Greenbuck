@@ -83,6 +83,23 @@ class ApiService {
     return sb.toString();
   }
 
+  // [CAPTURE FIX] Every research label header is padded to this fixed width.
+  // The labels travel inside the TLS traffic being measured, so their length
+  // shows up in the encrypted request size. X-Action was 5 bytes for "login"
+  // but 13 for "check_balance": each request carried a size difference that
+  // came from the label itself, not the app's behaviour, which a classifier
+  // could pick up. X-Encryption / X-Mitigation also differed in length between
+  // configurations, which skews size-overhead comparisons. Same idea as the
+  // fixed-length X-Request-ID above. The server strips the '.' padding
+  // (research_header() in api/main.py).
+  static const int _labelWidth = 16;
+
+  static String _label(String value) {
+    assert(value.length <= _labelWidth,
+        'research label "$value" is longer than $_labelWidth chars');
+    return value.padRight(_labelWidth, '.');
+  }
+
   // Build the research headers sent with every request.
   // X-Request-ID is generated per request for capture linkage.
   Map<String, String> _headers({String? action}) {
@@ -90,11 +107,11 @@ class ApiService {
       'Content-Type': 'application/json',
       'X-Request-ID': _newRequestId(),
       'X-Run-ID': runId,
-      'X-Action': action ?? 'unknown',
-      'X-Mode': mode,
-      'X-Encryption': encryption,
-      'X-Mitigation': mitigation,
-      'X-Platform': platform,
+      'X-Action': _label(action ?? 'unknown'),   // [CAPTURE FIX] fixed width
+      'X-Mode': _label(mode),                    // [CAPTURE FIX] fixed width
+      'X-Encryption': _label(encryption),        // [CAPTURE FIX] fixed width
+      'X-Mitigation': _label(mitigation),        // [CAPTURE FIX] fixed width
+      'X-Platform': _label(platform),            // [CAPTURE FIX] fixed width
     };
     // Attach the JWT on every request once logged in. Protected routes
     // (transactions, balance) require it; open routes ignore it.
