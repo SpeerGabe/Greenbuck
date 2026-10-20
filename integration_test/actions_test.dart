@@ -86,6 +86,8 @@ void main() {
           const Offset(0, -100),
         );
         await tester.tap(find.text('Log Out'));
+        // Wait for the logout request and the navigation back to the login screen.
+        await tester.pumpAndSettle(const Duration(seconds: 3));
         expect(find.text('Login'), findsOneWidget);
         break;
 
