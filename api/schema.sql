@@ -95,7 +95,11 @@ CREATE TABLE public.timing_log (
     duration_ms numeric(10,3),
     cpu_utilization numeric(5,2),
     endpoint character varying(100),
-    status_code integer
+    status_code integer,
+    -- [CAPTURE FIX] For /batch rows: comma-separated actions inside the bundle
+    -- (e.g. "check_balance,view_history"). NULL for every other endpoint.
+    -- Existing database: ALTER TABLE public.timing_log ADD COLUMN batch_actions text;
+    batch_actions text
 );
 
 ALTER TABLE public.timing_log OWNER TO postgres;
