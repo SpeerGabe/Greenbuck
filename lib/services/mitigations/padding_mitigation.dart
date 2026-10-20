@@ -1,7 +1,10 @@
 /*
-  padding mitigation scheme, adds padding to traffic before encryption to make it harder to analyze traffic
-  implements name and shapeBody methods from MitigationScheme
-  - shapeBody: adds filler to the json, before the closing brace in a new key called _pad, the server will ignore this key when parsing the json
+  padding mitigation scheme. Every request goes out at the same size:
+  - shapeBody: pads the plaintext JSON to plaintextTargetBytes before encryption (filler in a "_pad" key)
+  - padWireBody: pads the final body (plaintext or encrypted envelope) to wireTargetBytes (filler in a "_wpad" key)
+  - headerPad: X-Pad header value that makes the request line's method + path, the Authorization
+    header and the X-Pad header add up to headerBudgetBytes
+  The server ignores both keys and the header, and pads its responses the same way.
 */
 
 
@@ -9,29 +12,42 @@ import 'dart:convert';
 import 'mitigation_scheme.dart';
 
 class PaddingMitigation extends MitigationScheme {
-  static const int targetBytes = 4096; // 4KB. mirrors the server sided padding mitigation scheme
-
-  static const int _overheadBytes = 10; //net bytes the wrapper adds besides the filler
+  static const int plaintextTargetBytes = 2048; // mirrors PADDING_PLAINTEXT_BYTES in api/main.py
+  static const int wireTargetBytes = 4096; // mirrors PADDING_TARGET_BYTES in api/main.py
+  static const int headerBudgetBytes = 512;
 
   @override
   String get name => 'padding';
 
   @override
-  String shapeBody(String plaintextJson) {
-    //measure utf8 bytes of the plaintext json, if it is less than 4kb, add filler to reach 4kb
-    final currentBytes = utf8.encode(plaintextJson).length;
-    final padLength = targetBytes - currentBytes - _overheadBytes;
+  bool get padRequests => true;
 
-    //if over or empty, return plaintext json
-    final canPad = padLength > 0 && plaintextJson.endsWith('}') && plaintextJson != '{}';
-    if (!canPad) {
-      return plaintextJson;
-    }
+  @override
+  String shapeBody(String plaintextJson) => padJson(plaintextJson, plaintextTargetBytes, '_pad');
 
-    final filler = 'x' * padLength;
-    final withoutClosingBrace = plaintextJson.substring(0, plaintextJson.length -1);
-    //add filler to the json, before the closing brace in a new key called _pad, the server will ignore this key when parsing the json
-    final paddedJson = '$withoutClosingBrace,"_pad":"$filler"}'; 
-    return paddedJson;
+  @override
+  String padWireBody(String body) => padJson(body, wireTargetBytes, '_wpad');
+
+  @override
+  String headerPad({required String method, required String path, String? authorization}) {
+    // header lines are "Name: value\r\n"
+    final authLine = authorization == null ? 0 : 'Authorization: '.length + authorization.length + 2;
+    final padLine = 'X-Pad: '.length + 2;
+    final padLength = headerBudgetBytes - method.length - path.length - authLine - padLine;
+    return 'x' * (padLength > 1 ? padLength : 1);
   }
+}
+
+// Inserts a filler key into a JSON object so the result is exactly targetBytes (UTF-8).
+// Returns the input unchanged if it isn't a JSON object or is already too long.
+// Same algorithm as _pad_json() in api/main.py.
+String padJson(String json, int targetBytes, String key) {
+  if (!json.endsWith('}')) return json;
+  final isEmpty = json == '{}';
+  final prefix = isEmpty ? '{"$key":"' : ',"$key":"';
+  const suffix = '"}';
+  final kept = isEmpty ? '' : json.substring(0, json.length - 1);
+  final padLength = targetBytes - utf8.encode(kept).length - prefix.length - suffix.length;
+  if (padLength <= 0) return json;
+  return '$kept$prefix${'x' * padLength}$suffix';
 }
