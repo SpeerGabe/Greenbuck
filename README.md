@@ -13,7 +13,7 @@ A security-research project investigating whether TLS encryption alone conceals 
 - **Client:** Flutter (Dart) mobile app — six screens, real authentication, all traffic over TLS.
 - **Backend:** FastAPI (Python) — six endpoints, Argon2id password hashing, JWT auth, role-based access (admin/user). Two middleware layers instrument every request: one logs timing metadata, one applies configurable traffic-shaping defenses.
 - **Database:** PostgreSQL (users, transactions, timing_log).
-- **Capture rig:** Runs on a Raspberry Pi 5. A Python orchestrator starts tcpdump, triggers a user action via a Flutter integration test, stops the capture, and links each trace to its server-side timing record by request ID.
+- **Capture rig:** Runs on a Raspberry Pi 5 or a Linux server. A Python orchestrator starts tcpdump, triggers a user action via a Flutter integration test, stops the capture, and links each trace to its server-side timing record by request ID.
 - **Analysis:** Offline feature extraction and classification (Random Forest, k-NN).
 
 The backend, database, and capture point are co-located on the Pi to keep the single measured network hop clean. This is a controlled research testbed, not a production finance app.
@@ -151,8 +151,7 @@ UPDATE users SET role = 'admin' WHERE username = 'your-username';
 
 ### Running Captures (Data Collection)
 
-Captures run from your dev machine and require a reachable Raspberry Pi running
-the backend. The orchestrator starts tcpdump on the Pi, triggers a user action
+Captures run from your dev machine and require a reachable backend. The orchestrator starts tcpdump on the Pi, triggers a user action
 through the Flutter integration test, stops the capture, and pulls the resulting
 `.pcap` back to your machine.
 
@@ -166,7 +165,7 @@ through the Flutter integration test, stops the capture, and pulls the resulting
    ```
    (`run_capture.py` loads these via `python-dotenv`; the real `.env` is gitignored.)
 
-2. **Run a capture.** With the backend running on the Pi and an Android emulator
+2. **Run a capture.** With the backend running and an Android emulator
    (or device) active:
    ```
    python capture/run_capture.py --action check_balance --platform android --encryption none --mitigation none --run 1
