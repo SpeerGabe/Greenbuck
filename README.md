@@ -180,12 +180,17 @@ which is gitignored — raw capture data is not committed.
 ## Research Design
 
 - **Actions (6):** login, logout, register, view history, make transfer, check balance
-- **Mitigations:** none (control), and defenses grouped by class —
-  packet-level padding vs. random padding (size), batching vs. constant-rate
-  response (timing).
-  *(Planned design. The current capture code implements an earlier mitigation set
-  — response padding, jitter, and constant-rate — and is being extended to the
-  class-based set above.)*
+- **Mitigations:** none (control) plus four defenses:
+  - *padding* (size): every request and response body is 4096 B on the wire,
+    with plaintext first padded to 2048 B inside the encryption; small headers
+    even out the request line, Authorization header and status line
+  - *jitter* (timing): random 0–50 ms delay before each response
+  - *constant-rate* (timing): every response held to a fixed total time
+    (`CONSTANT_RATE_TARGET_MS`)
+  - *batching* (timing): the client queues requests for 300 ms and sends them
+    as one `/batch` request
+
+  Jitter and constant-rate run on the server only.
 - **Encryption:** multiple field-level cipher configurations (AES-GCM,
   ChaCha20-Poly1305, AES-256-CBC), treated as a controlled variable. *(The
   field-level encryption layer is in active development; the capture tool accepts
@@ -203,4 +208,3 @@ which is gitignored — raw capture data is not committed.
 - **Jose Hipolito** — field-level encryption (AES-256-CBC, AES-GCM, ChaCha20-Poly1305) on client and server, X25519 key exchange, encryption middleware,mitigations, security hardening
 
 ---
-
