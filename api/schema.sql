@@ -85,8 +85,8 @@ CREATE TABLE public.timing_log (
     id integer NOT NULL,
     request_id character varying(36) NOT NULL,
     run_id character varying(36),  -- capture run (X-Run-ID); joins to markers.jsonl
-    -- Existing database: ALTER TABLE public.timing_log ADD COLUMN run_id character varying(36);
     action_type character varying(50),
+    -- Existing database: ALTER TABLE public.timing_log ADD COLUMN run_id character varying(36);
     platform character varying(20),
     encryption_mode character varying(20),
     mitigation_state character varying(20),
@@ -96,8 +96,7 @@ CREATE TABLE public.timing_log (
     cpu_utilization numeric(5,2),
     endpoint character varying(100),
     status_code integer,
-    -- [CAPTURE FIX] For /batch rows: comma-separated actions inside the bundle
-    -- (e.g. "check_balance,view_history"). NULL for every other endpoint.
+    -- /batch rows: comma-separated actions in the bundle (e.g. "check_balance,view_history"). NULL otherwise.
     -- Existing database: ALTER TABLE public.timing_log ADD COLUMN batch_actions text;
     batch_actions text
 );
