@@ -169,11 +169,23 @@ through the Flutter integration test, stops the capture, and pulls the resulting
 2. **Run a capture.** With the backend running on the Pi and an Android emulator
    (or device) active:
    ```
-   python capture/run_capture.py --action check_balance --platform android --encryption none --mitigation none --run 1
+   python capture/run_capture.py --platform android --encryption none --mitigation none --run 1
    ```
+   One run is one capture: the database is reset, tcpdump starts, and the
+   integration test runs a shuffled schedule of actions in a single app session
+   (10 of each action by default). Options:
+   - `--per-action N` — iterations of each action
+   - `--mix make_transfer=20,logout=20,register=20,login=5` — iterations per
+     action; unlisted actions get 0. `make_transfer` is capped at 25 per run.
+   - `--seed N` — seed for the schedule shuffle (default random; written to the marker)
+   - `--think-ms N` — pause after each step (default 2000)
 
-Captured `.pcap` files and the `markers.jsonl` log are written to `capture/data/`,
-which is gitignored — raw capture data is not committed.
+   Set `FLUTTER_DEVICE` in `.env` (an id from `flutter devices`) if more than one
+   device is attached.
+
+Captured `.pcap` files, the per-run `markers.jsonl` log and the per-action
+`iterations.jsonl` log are written to `capture/data/`, which is gitignored — raw
+capture data is not committed.
 
 ---
 
