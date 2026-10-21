@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--encryption", required=True,
                         choices=["aesgcm", "chacha20", "aescbc", "none"])
     parser.add_argument("--mitigation", required=True,
-                        choices=["padding", "jitter", "constant", "batching", "none"])
+                        choices=["padding", "random_padding", "jitter", "constant", "batching", "none"])
     parser.add_argument("--run", type=int, required=True,
                         help="Run number within this configuration")
     args = parser.parse_args()
