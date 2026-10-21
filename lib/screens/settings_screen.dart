@@ -178,11 +178,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         _buildSection(
           title: 'Mitigation State',
-          subtitle: 'Server-side traffic shaping for timing defense',
+          subtitle: 'Traffic-shaping defense (size and timing)',
           child: Column(
             children: [
               _buildRadio('None (control)', 'none', _mitigation, _setMitigation),
-              _buildRadio('Response padding', 'padding', _mitigation, _setMitigation),
+              _buildRadio('Fixed padding', 'padding', _mitigation, _setMitigation),
+              _buildRadio('Random padding', 'random_padding', _mitigation, _setMitigation),
               _buildRadio('Timing jitter', 'jitter', _mitigation, _setMitigation),
               _buildRadio('Constant-rate', 'constant', _mitigation, _setMitigation),
               _buildRadio('Batching', 'batching', _mitigation, _setMitigation)
