@@ -38,16 +38,29 @@ class PaddingMitigation extends MitigationScheme {
   }
 }
 
-// Inserts a filler key into a JSON object so the result is exactly targetBytes (UTF-8).
+// Splits a JSON object into the part kept before the filler, and the text that goes
+// before and after the filler, so kept + prefix + filler + suffix is the same object
+// with a [key] field holding the filler.
+(String, String, String) _fillerParts(String json, String key) {
+  if (json == '{}') return ('', '{"$key":"', '"}');
+  return (json.substring(0, json.length - 1), ',"$key":"', '"}');
+}
+
+// Adds a [key] field holding [n] filler bytes to a JSON object.
+// Returns the input unchanged if it isn't a JSON object or n <= 0.
+// Same algorithm as _insert_filler() in api/main.py.
+String insertFiller(String json, int n, String key) {
+  if (!json.endsWith('}') || n <= 0) return json;
+  final (kept, prefix, suffix) = _fillerParts(json, key);
+  return '$kept$prefix${'x' * n}$suffix';
+}
+
+// Adds a [key] filler field to a JSON object so the result is exactly targetBytes (UTF-8).
 // Returns the input unchanged if it isn't a JSON object or is already too long.
 // Same algorithm as _pad_json() in api/main.py.
 String padJson(String json, int targetBytes, String key) {
   if (!json.endsWith('}')) return json;
-  final isEmpty = json == '{}';
-  final prefix = isEmpty ? '{"$key":"' : ',"$key":"';
-  const suffix = '"}';
-  final kept = isEmpty ? '' : json.substring(0, json.length - 1);
-  final padLength = targetBytes - utf8.encode(kept).length - prefix.length - suffix.length;
-  if (padLength <= 0) return json;
-  return '$kept$prefix${'x' * padLength}$suffix';
+  final (kept, prefix, suffix) = _fillerParts(json, key);
+  final n = targetBytes - utf8.encode(kept).length - prefix.length - suffix.length;
+  return insertFiller(json, n, key);
 }
