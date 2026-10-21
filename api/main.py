@@ -161,6 +161,7 @@ async def lifespan(app: FastAPI):
     sampler = asyncio.create_task(_cpu_sampler())
     logger.info(
         f"Mitigation params: padding={PADDING_PLAINTEXT_BYTES}B plaintext / {PADDING_TARGET_BYTES}B wire "
+        f"random_padding=1-{RANDOM_PAD_MAX_BYTES}B body + 1-{RANDOM_HEADER_PAD_MAX_BYTES}B header "
         f"jitter={JITTER_MIN_MS}-{JITTER_MAX_MS}ms constant={CONSTANT_RATE_TARGET_MS}ms"
     )
     yield # Server runs while paused here. After shutdown signal:
@@ -197,10 +198,11 @@ async def _username_from_token(request: Request) -> Optional[str]:
 # ============================================================
 # Mitigation Middleware
 # Applies server-side traffic shaping based on the X-Mitigation
-# header. Four mitigations plus a no-op control:
+# header. Five mitigations plus a no-op control:
 #   - none: passthrough (control condition)
 #   - padding: pads the plaintext response to PADDING_PLAINTEXT_BYTES
 #     (wire_padding_middleware then pads the final body on the wire)
+#   - random_padding: applied on the wire by wire_padding_middleware
 #   - jitter: random delay before response
 #   - constant: fixed total response time regardless of work
 #   - batching: handled by the /batch endpoint
@@ -210,6 +212,8 @@ async def _username_from_token(request: Request) -> Optional[str]:
 # in a follow-up study; for this paper they are held constant.
 PADDING_PLAINTEXT_BYTES = 2048  # Plaintext bodies, before encryption
 PADDING_TARGET_BYTES = 4096     # Final bodies on the wire (plaintext or encrypted envelope)
+RANDOM_PAD_MAX_BYTES = 4096         # Random padding: 1..max filler bytes added to each body
+RANDOM_HEADER_PAD_MAX_BYTES = 256   # Random padding: 1..max bytes in the X-Pad header
 JITTER_MIN_MS = 0             # Lower bound for jitter delay
 JITTER_MAX_MS = 50            # Upper bound for jitter delay
 # Constant-rate target, read from the environment (default 400 ms). Must be
@@ -217,25 +221,39 @@ JITTER_MAX_MS = 50            # Upper bound for jitter delay
 CONSTANT_RATE_TARGET_MS = float(os.environ.get("CONSTANT_RATE_TARGET_MS", "400"))
 
 # Mitigation labels the server accepts. Anything else gets a 400.
-VALID_MITIGATIONS = {"none", "padding", "jitter", "constant", "batching"}
+VALID_MITIGATIONS = {"none", "padding", "random_padding", "jitter", "constant", "batching"}
+
+
+def _filler_parts(body: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
+    """Split a JSON object into (kept, prefix, suffix) so kept + prefix + filler + suffix
+    is the same object with a `key` field holding the filler."""
+    if body == b"{}":
+        return b"", b'{"' + key + b'":"', b'"}'
+    return body[:-1], b',"' + key + b'":"', b'"}'
+
+
+def _insert_filler(body: bytes, n: int, key: bytes) -> bytes:
+    """Add a `key` field holding n filler bytes to a JSON object.
+
+    Returns the body unchanged if it isn't a JSON object or n <= 0.
+    Same algorithm as insertFiller() in lib/services/mitigations/padding_mitigation.dart.
+    """
+    if not body.endswith(b"}") or n <= 0:
+        return body
+    kept, prefix, suffix = _filler_parts(body, key)
+    return kept + prefix + b"x" * n + suffix
 
 
 def _pad_json(body: bytes, target: int, key: bytes) -> bytes:
-    """Insert a filler key into a JSON object so the body is exactly `target` bytes.
+    """Add a `key` filler field to a JSON object so the body is exactly `target` bytes.
 
     Returns the body unchanged if it isn't a JSON object or is already too long.
     Same algorithm as padJson() in lib/services/mitigations/padding_mitigation.dart.
     """
     if not body.endswith(b"}"):
         return body
-    empty = body == b"{}"
-    prefix = b'{"' + key + b'":"' if empty else b',"' + key + b'":"'
-    suffix = b'"}'
-    kept = b"" if empty else body[:-1]
-    pad_len = target - len(kept) - len(prefix) - len(suffix)
-    if pad_len <= 0:
-        return body
-    return kept + prefix + b"x" * pad_len + suffix
+    kept, prefix, suffix = _filler_parts(body, key)
+    return _insert_filler(body, target - len(kept) - len(prefix) - len(suffix), key)
 
 
 @app.middleware("http")
@@ -252,6 +270,10 @@ async def mitigation_middleware(request: Request, call_next):
 
     if mitigation == "none":
         # Control condition — no mitigation applied.
+        return response
+
+    elif mitigation == "random_padding":
+        # Applied on the wire by wire_padding_middleware.
         return response
 
     elif mitigation == "jitter":
@@ -377,12 +399,15 @@ async def encryption_middleware(request: Request, call_next):
 
 # ============================================================
 # Wire Padding Middleware
-# Under the padding mitigation, makes every response the same size on the
-# wire: pads the final body (plaintext, encrypted envelope or error) to
-# PADDING_TARGET_BYTES with a "_wpad" key, and adds an X-Pad header that
-# evens out the reason phrase in the status line ("OK" vs "Created").
-# Also logs a warning if requests within one run arrive at different sizes.
-# Sits outside the encryption middleware, so it sees the final body.
+# Pads the final response body (plaintext, encrypted envelope or error)
+# with a "_wpad" key and adds an X-Pad header. Sits outside the encryption
+# middleware, so it sees the final body.
+#   - padding: every body becomes PADDING_TARGET_BYTES and X-Pad evens out
+#     the reason phrase in the status line ("OK" vs "Created"), so every
+#     response is the same size. Also logs a warning if requests within one
+#     run arrive at different sizes.
+#   - random_padding: each body gets 1..RANDOM_PAD_MAX_BYTES filler bytes and
+#     X-Pad is 1..RANDOM_HEADER_PAD_MAX_BYTES long, drawn per response.
 # ============================================================
 PADDING_REASON_WIDTH = 32  # reason phrase + X-Pad value, in bytes
 
@@ -403,34 +428,41 @@ def _request_wire_size(request: Request) -> int:
 
 @app.middleware("http")
 async def wire_padding_middleware(request: Request, call_next):
-    if research_header(request, "X-Mitigation", "none") != "padding":
+    mitigation = research_header(request, "X-Mitigation", "none")
+    if mitigation not in ("padding", "random_padding"):
         return await call_next(request)
 
-    run_id = request.headers.get("X-Run-ID", "none")
-    size = _request_wire_size(request)
-    sizes = padded_request_sizes.setdefault(run_id, set())
-    if size not in sizes:
-        sizes.add(size)
-        if len(sizes) > 1:
-            logger.warning(
-                f"padding: request sizes differ in run {run_id}: {sorted(sizes)} B "
-                f"({request.method} {request.url.path} is {size} B)"
-            )
+    if mitigation == "padding":
+        run_id = request.headers.get("X-Run-ID", "none")
+        size = _request_wire_size(request)
+        sizes = padded_request_sizes.setdefault(run_id, set())
+        if size not in sizes:
+            sizes.add(size)
+            if len(sizes) > 1:
+                logger.warning(
+                    f"padding: request sizes differ in run {run_id}: {sorted(sizes)} B "
+                    f"({request.method} {request.url.path} is {size} B)"
+                )
 
     response = await call_next(request)
 
     body = b""
     async for chunk in response.body_iterator:
         body += chunk
-    body = _pad_json(body, PADDING_TARGET_BYTES, b"_wpad")
-    if len(body) != PADDING_TARGET_BYTES:
-        logger.warning(
-            f"padding miss: {request.url.path} wire body is {len(body)} B, target {PADDING_TARGET_BYTES} B"
-        )
-
     headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
-    phrase = HTTPStatus(response.status_code).phrase
-    headers["X-Pad"] = "x" * max(1, PADDING_REASON_WIDTH - len(phrase))
+
+    if mitigation == "padding":
+        body = _pad_json(body, PADDING_TARGET_BYTES, b"_wpad")
+        if len(body) != PADDING_TARGET_BYTES:
+            logger.warning(
+                f"padding miss: {request.url.path} wire body is {len(body)} B, target {PADDING_TARGET_BYTES} B"
+            )
+        phrase = HTTPStatus(response.status_code).phrase
+        headers["X-Pad"] = "x" * max(1, PADDING_REASON_WIDTH - len(phrase))
+    else:
+        body = _insert_filler(body, 1 + secrets.randbelow(RANDOM_PAD_MAX_BYTES), b"_wpad")
+        headers["X-Pad"] = "x" * (1 + secrets.randbelow(RANDOM_HEADER_PAD_MAX_BYTES))
+
     return Response(
         content=body,
         status_code=response.status_code,
