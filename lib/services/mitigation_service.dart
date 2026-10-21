@@ -6,6 +6,7 @@ import 'mitigations/constant_mitigation.dart';
 import 'mitigations/jitter_mitigation.dart';
 import 'mitigations/none_mitigation.dart';
 import 'mitigations/padding_mitigation.dart';
+import 'mitigations/random_padding_mitigation.dart';
 
 class MitigationService {
   final Map<String, MitigationScheme> availableSchemes = {
@@ -13,6 +14,7 @@ class MitigationService {
     'jitter': JitterMitigation(),
     'none': NoMitigation(),
     'padding': PaddingMitigation(),
+    'random_padding': RandomPaddingMitigation(),
     'batching': BatchingMitigation(),
   };
 
