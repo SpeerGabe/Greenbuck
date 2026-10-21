@@ -13,7 +13,7 @@ A security-research project investigating whether TLS encryption alone conceals 
 - **Client:** Flutter (Dart) mobile app — six screens, real authentication, all traffic over TLS.
 - **Backend:** FastAPI (Python) — six endpoints, Argon2id password hashing, JWT auth, role-based access (admin/user). Two middleware layers instrument every request: one logs timing metadata, one applies configurable traffic-shaping defenses.
 - **Database:** PostgreSQL (users, transactions, timing_log).
-- **Capture rig:** Runs on a Raspberry Pi 5 or a Linux server. A Python orchestrator starts tcpdump, triggers a user action via a Flutter integration test, stops the capture, and links each trace to its server-side timing record by request ID.
+- **Capture rig:** Runs on a Raspberry Pi 5. A Python orchestrator starts tcpdump, triggers a user action via a Flutter integration test, stops the capture, and links each trace to its server-side timing record by request ID.
 - **Analysis:** Offline feature extraction and classification (Random Forest, k-NN).
 
 The backend, database, and capture point are co-located on the Pi to keep the single measured network hop clean. This is a controlled research testbed, not a production finance app.
@@ -151,7 +151,8 @@ UPDATE users SET role = 'admin' WHERE username = 'your-username';
 
 ### Running Captures (Data Collection)
 
-Captures run from your dev machine and require a reachable backend. The orchestrator starts tcpdump on the Pi, triggers a user action
+Captures run from your dev machine and require a reachable Raspberry Pi running
+the backend. The orchestrator starts tcpdump on the Pi, triggers a user action
 through the Flutter integration test, stops the capture, and pulls the resulting
 `.pcap` back to your machine.
 
@@ -165,7 +166,7 @@ through the Flutter integration test, stops the capture, and pulls the resulting
    ```
    (`run_capture.py` loads these via `python-dotenv`; the real `.env` is gitignored.)
 
-2. **Run a capture.** With the backend running and an Android emulator
+2. **Run a capture.** With the backend running on the Pi and an Android emulator
    (or device) active:
    ```
    python capture/run_capture.py --action check_balance --platform android --encryption none --mitigation none --run 1
@@ -179,21 +180,24 @@ which is gitignored — raw capture data is not committed.
 ## Research Design
 
 - **Actions (6):** login, logout, register, view history, make transfer, check balance
-- **Mitigations:** none (control) plus four defenses:
-  - *padding* (size): every request and response body is 4096 B on the wire,
-    with plaintext first padded to 2048 B inside the encryption; small headers
-    even out the request line, Authorization header and status line
-  - *jitter* (timing): random 0–50 ms delay before each response
-  - *constant-rate* (timing): every response held to a fixed total time
-    (`CONSTANT_RATE_TARGET_MS`)
+- **Mitigations:** none (control) plus two size and three timing defenses:
+  - *padding* (size, fixed): every request and response body is 4096 B on the
+    wire, with plaintext first padded to 2048 B inside the encryption; small
+    headers even out the request line, Authorization header and status line
+  - *random padding* (size, random): every request and response body gets a
+    random 1–4096 B of filler and a random 1–256 B header, drawn per message
+  - *jitter* (timing, random): random 0–50 ms delay before each response, on
+    the server only
+  - *constant-rate* (timing, fixed): every response held to a fixed total time
+    (`CONSTANT_RATE_TARGET_MS`), on the server only
   - *batching* (timing): the client queues requests for 300 ms and sends them
     as one `/batch` request
 
-  Jitter and constant-rate run on the server only.
+  Both padding defenses send a body on every request, GETs included.
 - **Encryption:** multiple field-level cipher configurations (AES-GCM,
   ChaCha20-Poly1305, AES-256-CBC) on client and server, keyed per session by
   an X25519 exchange at login, treated as a controlled variable. AES-256-CBC is
-  unauthenticated and serves as the weak baseline
+  unauthenticated and serves as the weak baseline.
 - **Analysis:** supervised classification (Random Forest, k-NN) on features
   extracted from captured traffic
 - **Primary result:** a privacy-utility tradeoff curve — each mitigation's
