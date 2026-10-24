@@ -164,7 +164,7 @@ def start_tcpdump(ssh, filename):
     """Start tcpdump on the capture host. Returns the real tcpdump pid."""
     remote_path = f"{PI_CAPTURE_DIR}/{filename}"
     log_path = f"{PI_CAPTURE_DIR}/tcpdump.log"
-    ssh_run(ssh, f"mkdir -p {PI_CAPTURE_DIR}")  # wait for it, so tcpdump never races it
+    ssh_run(ssh, f"mkdir -p {PI_CAPTURE_DIR} && chmod 777 {PI_CAPTURE_DIR}")  # wait for it, so tcpdump never races it
     # Start tcpdump unbuffered in the background. We fetch the real
     # tcpdump pid separately with pgrep (not sudo's or the subshell's).
     # --immediate-mode delivers each packet as it arrives, so nothing is left
@@ -174,7 +174,7 @@ def start_tcpdump(ssh, filename):
     # sudo -n fails instead of waiting for a password; sudo's and tcpdump's
     # messages go to tcpdump.log.
     cmd = (
-        f"sudo -n tcpdump -Z root -i {PI_INTERFACE} --immediate-mode -U -w {remote_path} "
+        f"sudo -n tcpdump -i {PI_INTERFACE} --immediate-mode -U -w {remote_path} "
         f"port 8000 > {log_path} 2>&1 &"
     )
     ssh.exec_command(cmd)
