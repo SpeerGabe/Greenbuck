@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\caption{Cost of each defense relative to no defense, averaged over the four cipher settings. Bandwidth is TLS application bytes per run; time is the phone-measured duration of each user action. Differences within $\pm$30\,ms are within run-to-run variation.}
+\label{tab:overhead}
+\begin{tabular}{lrr}
+\toprule
+Defense & Bandwidth (\%) & Time per action (ms) \\
+\midrule
+Fixed padding & +689 & -15 \\
+Random padding & +373 & -26 \\
+Jitter & 0 & +117 \\
+Constant-rate & 0 & +1497 \\
+Batching & -9 & +368 \\
+\bottomrule
+\end{tabular}
+\end{table}
